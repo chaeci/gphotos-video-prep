@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Google Photos Pre-2013 Video Prep Tool (Windows / macOS / Linux)
+Google Photos Pre-2013 Photo & Video Prep Tool (Windows / macOS / Linux)
 
-3-step workflow using Python standard library + FFmpeg/FFprobe:
-  1. scan    : Recursively scan video files, probe codecs/dates, extract thumbnails.
-  2. review  : Launch local browser UI to inspect thumbnails & mark rotations.
-  3. convert : Batch convert rotated & legacy videos to H.264/AAC MP4 preserving dates.
+4-step browser wizard & CLI using Python standard library + FFmpeg/FFprobe:
+  1. scan    : Recursively scan videos & images, probe codecs/EXIF/dates, extract thumbnails.
+  2. review  : Launch local browser UI to preview, rotate, delete to trash, or merge clips.
+  3. convert : Batch convert/rotate videos & images preserving dates/EXIF and move deleted files to trash.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -48,10 +49,25 @@ LEGACY_CONTAINERS = {
 }
 VIDEO_EXTENSIONS = MODERN_CONTAINERS | LEGACY_CONTAINERS
 
+MODERN_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"}
+LEGACY_IMAGE_EXTENSIONS = {".bmp", ".tif", ".tiff", ".jfif"}
+IMAGE_EXTENSIONS = MODERN_IMAGE_EXTENSIONS | LEGACY_IMAGE_EXTENSIONS
+BROWSER_NATIVE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+IMAGE_MIME_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".jfif": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+}
+
 SKIP_DIR_NAMES = {
     "_gphotos_work",
     "_converted",
     "_original_backup",
+    "deleted_trash",
     "$recycle.bin",
     "system volume information",
 }
@@ -429,6 +445,448 @@ def extract_thumbnail(
     return False
 
 
+JPEG_SOF_MARKERS = {
+    0xC0, 0xC1, 0xC2, 0xC3,
+    0xC5, 0xC6, 0xC7,
+    0xC9, 0xCA, 0xCB,
+    0xCD, 0xCE, 0xCF,
+}
+EXIF_ORIENTATION_TO_ROT = {6: 90, 3: 180, 8: 270}
+
+
+def _read_tiff_ascii(tiff: bytes, endian: str, typ: int, cnt: int, val_field_off: int) -> str:
+    """Read an ASCII string field from TIFF/EXIF bytes."""
+    if typ != 2 or cnt <= 0 or val_field_off + 4 > len(tiff):
+        return ""
+    if cnt <= 4:
+        raw = tiff[val_field_off : val_field_off + cnt]
+    else:
+        data_off = struct.unpack_from(endian + "I", tiff, val_field_off)[0]
+        if data_off + cnt > len(tiff):
+            return ""
+        raw = tiff[data_off : data_off + cnt]
+    return raw.split(b"\x00", 1)[0].decode("ascii", errors="ignore").strip()
+
+
+def _parse_exif_tiff_block(tiff: bytes) -> tuple[int, str]:
+    """Parse Orientation rotation and best capture date string from TIFF bytes."""
+    if len(tiff) < 8:
+        return 0, ""
+    byte_order = tiff[:2]
+    if byte_order == b"II":
+        endian = "<"
+    elif byte_order == b"MM":
+        endian = ">"
+    else:
+        return 0, ""
+
+    magic, ifd0_off = struct.unpack_from(endian + "HI", tiff, 2)
+    if magic != 42 or ifd0_off + 2 > len(tiff):
+        return 0, ""
+
+    meta_rotation = 0
+    dt_ifd0 = ""
+    dt_orig = ""
+    dt_digi = ""
+    exif_ifd_off = 0
+
+    count0 = struct.unpack_from(endian + "H", tiff, ifd0_off)[0]
+    for i in range(count0):
+        entry_off = ifd0_off + 2 + i * 12
+        if entry_off + 12 > len(tiff):
+            break
+        tag, typ, cnt = struct.unpack_from(endian + "HHI", tiff, entry_off)
+        val_off = entry_off + 8
+        if tag == 0x0112 and typ == 3 and cnt >= 1:
+            orient = struct.unpack_from(endian + "H", tiff, val_off)[0]
+            meta_rotation = EXIF_ORIENTATION_TO_ROT.get(orient, 0)
+        elif tag == 0x0132:
+            dt_ifd0 = _read_tiff_ascii(tiff, endian, typ, cnt, val_off)
+        elif tag == 0x8769 and cnt >= 1:
+            exif_ifd_off = struct.unpack_from(endian + "I", tiff, val_off)[0]
+
+    if exif_ifd_off and exif_ifd_off + 2 <= len(tiff):
+        count_sub = struct.unpack_from(endian + "H", tiff, exif_ifd_off)[0]
+        for i in range(count_sub):
+            entry_off = exif_ifd_off + 2 + i * 12
+            if entry_off + 12 > len(tiff):
+                break
+            tag, typ, cnt = struct.unpack_from(endian + "HHI", tiff, entry_off)
+            val_off = entry_off + 8
+            if tag == 0x9003:
+                dt_orig = _read_tiff_ascii(tiff, endian, typ, cnt, val_off)
+            elif tag == 0x9004:
+                dt_digi = _read_tiff_ascii(tiff, endian, typ, cnt, val_off)
+
+    best_date = ""
+    for candidate in (dt_orig, dt_digi, dt_ifd0):
+        if candidate and not candidate.startswith("0000:00:00"):
+            best_date = candidate
+            break
+    return meta_rotation, best_date
+
+
+def parse_jpeg_info(file_path: Path) -> dict[str, Any]:
+    """Read dimensions, EXIF orientation rotation, and capture date from a JPEG file."""
+    info: dict[str, Any] = {"width": 0, "height": 0, "meta_rotation": 0, "date_str": ""}
+    try:
+        with file_path.open("rb") as f:
+            if f.read(2) != b"\xff\xd8":
+                return info
+            while True:
+                b = f.read(1)
+                if not b:
+                    break
+                while b == b"\xff":
+                    nxt = f.read(1)
+                    if not nxt:
+                        b = b""
+                        break
+                    if nxt != b"\xff":
+                        b = nxt
+                        break
+                if not b:
+                    break
+                m = b[0]
+                if m in (0xD9, 0xDA):
+                    break
+                if m == 0x00 or m == 0x01 or (0xD0 <= m <= 0xD7):
+                    continue
+                seg_len_raw = f.read(2)
+                if len(seg_len_raw) < 2:
+                    break
+                seg_len = struct.unpack(">H", seg_len_raw)[0]
+                if seg_len < 2:
+                    break
+                payload_len = seg_len - 2
+                if m == 0xE1 or m in JPEG_SOF_MARKERS:
+                    payload = f.read(payload_len)
+                    if len(payload) < payload_len:
+                        break
+                    if m == 0xE1 and payload.startswith(b"Exif\x00\x00") and not info["date_str"] and info["meta_rotation"] == 0:
+                        rot, dt_str = _parse_exif_tiff_block(payload[6:])
+                        info["meta_rotation"] = rot
+                        if dt_str:
+                            info["date_str"] = dt_str
+                    elif m in JPEG_SOF_MARKERS and len(payload) >= 5 and info["width"] == 0:
+                        h, w = struct.unpack_from(">HH", payload, 1)
+                        info["width"] = int(w)
+                        info["height"] = int(h)
+                else:
+                    f.seek(payload_len, os.SEEK_CUR)
+    except Exception:
+        pass
+    return info
+
+
+def read_image_basic_info(file_path: Path) -> dict[str, Any]:
+    """Read image width, height, EXIF rotation, and EXIF date without external libs."""
+    ext = file_path.suffix.lower()
+    if ext in {".jpg", ".jpeg", ".jfif"}:
+        return parse_jpeg_info(file_path)
+
+    info: dict[str, Any] = {"width": 0, "height": 0, "meta_rotation": 0, "date_str": ""}
+    try:
+        with file_path.open("rb") as f:
+            head = f.read(64)
+        if ext == ".png" and len(head) >= 24 and head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+            w, h = struct.unpack_from(">II", head, 16)
+            info["width"], info["height"] = int(w), int(h)
+        elif ext == ".gif" and len(head) >= 10 and head[:6] in (b"GIF87a", b"GIF89a"):
+            w, h = struct.unpack_from("<HH", head, 6)
+            info["width"], info["height"] = int(w), int(h)
+        elif ext == ".bmp" and len(head) >= 26 and head[:2] == b"BM":
+            w, h = struct.unpack_from("<ii", head, 18)
+            info["width"], info["height"] = abs(int(w)), abs(int(h))
+        elif ext == ".webp" and len(head) >= 30 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            chunk = head[12:16]
+            if chunk == b"VP8X":
+                w = 1 + int.from_bytes(head[24:27], "little")
+                h = 1 + int.from_bytes(head[27:30], "little")
+                info["width"], info["height"] = w, h
+            elif chunk == b"VP8 " and head[23:26] == b"\x9d\x01\x2a":
+                w, h = struct.unpack_from("<HH", head, 26)
+                info["width"], info["height"] = w & 0x3FFF, h & 0x3FFF
+            elif chunk == b"VP8L" and head[20] == 0x2F:
+                b0, b1, b2, b3 = head[21:25]
+                w = 1 + (((b1 & 0x3F) << 8) | b0)
+                h = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6))
+                info["width"], info["height"] = w, h
+    except Exception:
+        pass
+    return info
+
+
+def extract_and_patch_jpeg_exif(src_path: Path) -> bytes | None:
+    """
+    Extract the APP1 Exif payload from a JPEG and reset Orientation (0x0112) to 1
+    so physically rotated output pixels are never double-rotated by viewers.
+    """
+    try:
+        with src_path.open("rb") as f:
+            if f.read(2) != b"\xff\xd8":
+                return None
+            raw_payload: bytes | None = None
+            while True:
+                b = f.read(1)
+                if not b:
+                    break
+                while b == b"\xff":
+                    nxt = f.read(1)
+                    if not nxt:
+                        b = b""
+                        break
+                    if nxt != b"\xff":
+                        b = nxt
+                        break
+                if not b:
+                    break
+                m = b[0]
+                if m in (0xD9, 0xDA):
+                    break
+                if m == 0x00 or m == 0x01 or (0xD0 <= m <= 0xD7):
+                    continue
+                seg_len_raw = f.read(2)
+                if len(seg_len_raw) < 2:
+                    break
+                seg_len = struct.unpack(">H", seg_len_raw)[0]
+                if seg_len < 2:
+                    break
+                payload_len = seg_len - 2
+                if m == 0xE1:
+                    payload = f.read(payload_len)
+                    if len(payload) == payload_len and payload.startswith(b"Exif\x00\x00"):
+                        raw_payload = payload
+                        break
+                else:
+                    f.seek(payload_len, os.SEEK_CUR)
+    except Exception:
+        return None
+
+    if raw_payload is None or len(raw_payload) < 14:
+        return None
+
+    buf = bytearray(raw_payload)
+    tiff_base = 6
+    byte_order = bytes(buf[tiff_base : tiff_base + 2])
+    if byte_order == b"II":
+        endian = "<"
+    elif byte_order == b"MM":
+        endian = ">"
+    else:
+        return None
+
+    magic, ifd0_off = struct.unpack_from(endian + "HI", buf, tiff_base + 2)
+    if magic != 42 or tiff_base + ifd0_off + 2 > len(buf):
+        return None
+
+    def patch_ifd(ifd_rel_off: int) -> int:
+        if ifd_rel_off <= 0 or tiff_base + ifd_rel_off + 2 > len(buf):
+            return 0
+        cnt_entries = struct.unpack_from(endian + "H", buf, tiff_base + ifd_rel_off)[0]
+        for idx in range(cnt_entries):
+            e_off = tiff_base + ifd_rel_off + 2 + idx * 12
+            if e_off + 12 > len(buf):
+                return 0
+            tag, typ, cnt = struct.unpack_from(endian + "HHI", buf, e_off)
+            if tag == 0x0112 and typ == 3 and cnt == 1:
+                struct.pack_into(endian + "H", buf, e_off + 8, 1)
+        next_ptr_off = tiff_base + ifd_rel_off + 2 + cnt_entries * 12
+        if next_ptr_off + 4 <= len(buf):
+            return struct.unpack_from(endian + "I", buf, next_ptr_off)[0]
+        return 0
+
+    ifd1_off = patch_ifd(ifd0_off)
+    if ifd1_off:
+        patch_ifd(ifd1_off)
+    return bytes(buf)
+
+
+def build_minimal_exif_payload(best_date_utc: str) -> bytes:
+    """Build a minimal little-endian TIFF/EXIF APP1 payload with Orientation=1 and capture date."""
+    dt = parse_tag_datetime(best_date_utc)
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    dt_local = dt.astimezone(local_tz())
+    dt_bytes = dt_local.strftime("%Y:%m:%d %H:%M:%S").encode("ascii") + b"\x00"  # 20 bytes
+
+    tiff_header = b"II" + struct.pack("<HI", 42, 8)
+    ifd0 = bytearray()
+    ifd0 += struct.pack("<H", 3)
+    ifd0 += struct.pack("<HHIHH", 0x0112, 3, 1, 1, 0)       # Orientation = 1
+    ifd0 += struct.pack("<HHII", 0x0132, 2, 20, 50)         # DateTime
+    ifd0 += struct.pack("<HHII", 0x8769, 4, 1, 70)          # ExifIFDPointer
+    ifd0 += struct.pack("<I", 0)
+
+    exif_sub = bytearray()
+    exif_sub += struct.pack("<H", 2)
+    exif_sub += struct.pack("<HHII", 0x9003, 2, 20, 100)    # DateTimeOriginal
+    exif_sub += struct.pack("<HHII", 0x9004, 2, 20, 120)    # DateTimeDigitized
+    exif_sub += struct.pack("<I", 0)
+
+    return b"Exif\x00\x00" + tiff_header + bytes(ifd0) + dt_bytes + bytes(exif_sub) + dt_bytes + dt_bytes
+
+
+def inject_jpeg_exif(src_path: Path, dst_path: Path, best_date_utc: str) -> None:
+    """
+    Inject patched source EXIF (with Orientation reset to 1) or minimal capture-date EXIF
+    into a newly written JPEG file atomically.
+    """
+    try:
+        dst_bytes = dst_path.read_bytes()
+        if len(dst_bytes) < 4 or not dst_bytes.startswith(b"\xff\xd8"):
+            return
+
+        exif_payload: bytes | None = None
+        if src_path.suffix.lower() in {".jpg", ".jpeg", ".jfif"}:
+            exif_payload = extract_and_patch_jpeg_exif(src_path)
+        if exif_payload is None:
+            exif_payload = build_minimal_exif_payload(best_date_utc)
+
+        app1_segment = b"\xff\xe1" + struct.pack(">H", len(exif_payload) + 2) + exif_payload
+        out = bytearray(b"\xff\xd8")
+        inserted = False
+        pos = 2
+        n = len(dst_bytes)
+
+        while pos < n:
+            if dst_bytes[pos] != 0xFF:
+                if not inserted:
+                    out.extend(app1_segment)
+                    inserted = True
+                out.extend(dst_bytes[pos:])
+                break
+            marker_start = pos
+            while pos < n and dst_bytes[pos] == 0xFF:
+                pos += 1
+            if pos >= n:
+                if not inserted:
+                    out.extend(app1_segment)
+                    inserted = True
+                out.extend(dst_bytes[marker_start:])
+                break
+            m = dst_bytes[pos]
+            pos += 1
+
+            if m in (0xD9, 0xDA):
+                if not inserted:
+                    out.extend(app1_segment)
+                    inserted = True
+                out.extend(dst_bytes[marker_start:])
+                break
+            if m == 0x00 or m == 0x01 or (0xD0 <= m <= 0xD7):
+                out.extend(dst_bytes[marker_start:pos])
+                continue
+            if pos + 2 > n:
+                if not inserted:
+                    out.extend(app1_segment)
+                    inserted = True
+                out.extend(dst_bytes[marker_start:])
+                break
+            seg_len = struct.unpack_from(">H", dst_bytes, pos)[0]
+            seg_end = pos + seg_len
+            if seg_len < 2 or seg_end > n:
+                if not inserted:
+                    out.extend(app1_segment)
+                    inserted = True
+                out.extend(dst_bytes[marker_start:])
+                break
+
+            payload = dst_bytes[pos + 2 : seg_end]
+            if m == 0xE0:
+                out.extend(dst_bytes[marker_start:seg_end])
+                if not inserted:
+                    out.extend(app1_segment)
+                    inserted = True
+            elif m == 0xE1 and payload.startswith(b"Exif\x00\x00"):
+                if not inserted:
+                    out.extend(app1_segment)
+                    inserted = True
+            else:
+                if not inserted:
+                    out.extend(app1_segment)
+                    inserted = True
+                out.extend(dst_bytes[marker_start:seg_end])
+            pos = seg_end
+
+        tmp_path = dst_path.with_name(dst_path.name + ".exif.tmp")
+        tmp_path.write_bytes(bytes(out))
+        os.replace(tmp_path, dst_path)
+    except Exception:
+        pass
+
+
+def classify_image(ext: str) -> tuple[bool, str]:
+    """Classify image extension into compatible vs legacy/conversion-needed."""
+    ext_lower = ext.lower()
+    if ext_lower in {".bmp", ".tif", ".tiff"}:
+        return True, f"구형 이미지 ({ext_lower} → .jpg)"
+    if ext_lower == ".jfif":
+        return True, "호환 변환 (.jfif → .jpg)"
+    return False, "호환 이미지 (유지)"
+
+
+def extract_image_thumbnail(
+    file_path: Path,
+    thumb_path: Path,
+    ffmpeg_bin: str = "ffmpeg",
+    max_dim: int = 320,
+    quality: int = 5,
+) -> bool:
+    """Create a JPEG thumbnail or preview for an image using FFmpeg."""
+    thumb_path.parent.mkdir(parents=True, exist_ok=True)
+    vf = f"scale='min({int(max_dim)},iw)':'min({int(max_dim)},ih)':force_original_aspect_ratio=decrease"
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i", str(file_path),
+        "-frames:v", "1",
+        "-vf", vf,
+        "-q:v", str(int(quality)),
+        str(thumb_path),
+    ]
+    try:
+        res = run_cmd(cmd, timeout=45)
+        return bool(res.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 0)
+    except Exception:
+        return False
+
+
+def build_ffmpeg_image_cmd(
+    src_path: Path,
+    dst_path: Path,
+    user_rotation: int,
+    ffmpeg_bin: str = "ffmpeg",
+) -> list[str]:
+    """Build FFmpeg command to rotate/convert a single image file."""
+    filters: list[str] = []
+    if user_rotation == 90:
+        filters.append("transpose=1")
+    elif user_rotation == 180:
+        filters.append("hflip,vflip")
+    elif user_rotation == 270:
+        filters.append("transpose=2")
+
+    cmd = [ffmpeg_bin, "-y", "-i", str(src_path)]
+    if filters:
+        cmd.extend(["-vf", ",".join(filters)])
+    ext_lower = dst_path.suffix.lower()
+    if ext_lower != ".gif":
+        cmd.extend(["-frames:v", "1"])
+    if ext_lower in {".jpg", ".jpeg"}:
+        cmd.extend(["-q:v", "2"])
+    elif ext_lower == ".webp":
+        cmd.extend(["-quality", "90"])
+    cmd.append(str(dst_path))
+    return cmd
+
+
+def verify_output_image(out_path: Path) -> None:
+    """Verify converted image exists and is non-empty."""
+    if not out_path.exists() or out_path.stat().st_size <= 0:
+        raise RuntimeError("출력 이미지 파일이 비어 있거나 생성되지 않았습니다.")
+
+
 def build_ffmpeg_convert_cmd(
     src_path: Path,
     dst_path: Path,
@@ -666,6 +1124,8 @@ def auto_detect_merge_groups(
     }
     by_folder: dict[str, list[dict[str, Any]]] = {}
     for item in plan.get("items") or []:
+        if item.get("media_type", "video") != "video" or item.get("delete"):
+            continue
         if item["id"] in grouped_ids:
             continue
         folder = Path(item["rel_path"]).parent.as_posix()
@@ -718,23 +1178,29 @@ def atomic_write_json(path: Path, data: Any) -> None:
 
 
 def load_plan(work_dir: Path) -> dict[str, Any]:
-    """Load plan.json from work_dir."""
+    """Load plan.json from work_dir and normalize item defaults for backward compatibility."""
     plan_path = work_dir / "plan.json"
     if not plan_path.exists():
         raise FileNotFoundError(f"plan.json을 찾을 수 없습니다: {plan_path}")
     with plan_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     data.setdefault("merge_groups", [])
+    for item in data.get("items") or []:
+        item.setdefault("media_type", "video")
+        item.setdefault("delete", False)
     return data
 
 
-def find_video_files(source_dir: Path, work_dir: Path) -> list[Path]:
-    """Recursively find video files while skipping work/backup/system directories."""
+def find_media_files(
+    source_dir: Path,
+    work_dir: Path,
+    include_images: bool = True,
+) -> list[tuple[Path, str]]:
+    """Recursively find video (and optionally image) files while skipping work/trash/system dirs."""
     work_resolved = work_dir.resolve()
-    results: list[Path] = []
+    results: list[tuple[Path, str]] = []
     for root, dirs, files in os.walk(source_dir):
         root_path = Path(root)
-        # Prune skipped directories in-place
         kept_dirs = []
         for d in sorted(dirs):
             d_path = root_path / d
@@ -750,9 +1216,17 @@ def find_video_files(source_dir: Path, work_dir: Path) -> list[Path]:
 
         for fname in sorted(files):
             fpath = root_path / fname
-            if fpath.suffix.lower() in VIDEO_EXTENSIONS:
-                results.append(fpath)
+            ext = fpath.suffix.lower()
+            if ext in VIDEO_EXTENSIONS:
+                results.append((fpath, "video"))
+            elif include_images and ext in IMAGE_EXTENSIONS:
+                results.append((fpath, "image"))
     return results
+
+
+def find_video_files(source_dir: Path, work_dir: Path) -> list[Path]:
+    """Backward-compatible helper returning only video file paths."""
+    return [fpath for fpath, _ in find_media_files(source_dir, work_dir, include_images=False)]
 
 
 def scan_single_video(
@@ -782,6 +1256,8 @@ def scan_single_video(
         and thumb_path.stat().st_size > 0
         and not prev.get("probe_error")
     ):
+        prev.setdefault("media_type", "video")
+        prev.setdefault("delete", False)
         return prev
 
     try:
@@ -838,6 +1314,7 @@ def scan_single_video(
     user_rotation = int(prev.get("user_rotation", 0)) if prev else 0
     if user_rotation not in VALID_ROTATIONS:
         user_rotation = 0
+    delete_flag = bool(prev.get("delete", False)) if prev else False
     convert_flag = bool(prev["convert"]) if (prev and "convert" in prev) else needs_convert
     if user_rotation != 0:
         convert_flag = True
@@ -848,6 +1325,7 @@ def scan_single_video(
 
     return {
         "id": item_id,
+        "media_type": "video",
         "rel_path": rel_posix,
         "filename": file_path.name,
         "ext": file_path.suffix.lower(),
@@ -867,10 +1345,133 @@ def scan_single_video(
         "reason": reason,
         "user_rotation": user_rotation,
         "convert": convert_flag,
+        "delete": delete_flag,
         "reviewed": reviewed,
         "status": status,
         "thumb": thumb_rel if thumb_ok else "",
         "thumb_offset_idx": prev.get("thumb_offset_idx", 0) if prev else 0,
+        "probe_error": probe_error,
+    }
+
+
+def scan_single_image(
+    file_path: Path,
+    source_dir: Path,
+    thumbs_dir: Path,
+    existing_by_rel: dict[str, dict[str, Any]],
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+) -> dict[str, Any]:
+    """Inspect image dimensions/EXIF/date and create a JPEG thumbnail, preserving user choices."""
+    rel_posix = file_path.relative_to(source_dir).as_posix()
+    stat = file_path.stat()
+    file_size = stat.st_size
+    file_mtime = stat.st_mtime
+
+    prev = existing_by_rel.get(rel_posix)
+    item_id = prev["id"] if prev and prev.get("id") else make_item_id(rel_posix)
+    thumb_rel = f"thumbs/{item_id}.jpg"
+    thumb_path = thumbs_dir / f"{item_id}.jpg"
+
+    if (
+        prev is not None
+        and prev.get("size_bytes") == file_size
+        and abs(float(prev.get("mtime_epoch", 0)) - file_mtime) < 1e-3
+        and thumb_path.exists()
+        and thumb_path.stat().st_size > 0
+        and not prev.get("probe_error")
+    ):
+        prev.setdefault("media_type", "image")
+        prev.setdefault("delete", False)
+        return prev
+
+    probe_error = ""
+    info = read_image_basic_info(file_path)
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    meta_rotation = int(info.get("meta_rotation") or 0)
+    probe_data: dict[str, Any] = {}
+
+    if width <= 0 or height <= 0:
+        try:
+            probe_data = probe_video(file_path, ffprobe_bin=ffprobe_bin)
+            v_streams = [s for s in probe_data.get("streams") or [] if s.get("codec_type") == "video"]
+            if v_streams:
+                v0 = v_streams[0]
+                width = int(v0.get("width") or 0)
+                height = int(v0.get("height") or 0)
+                if meta_rotation == 0:
+                    meta_rotation = parse_rotation_from_stream(v0)
+        except Exception as exc:
+            probe_error = str(exc)
+
+    exif_dt = parse_tag_datetime(info.get("date_str") or "")
+    if exif_dt is not None:
+        utc_iso = exif_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        utc_epoch = exif_dt.timestamp()
+        date_source = "metadata"
+    elif probe_data:
+        utc_iso, utc_epoch, date_source = detect_best_date(probe_data, file_path.name, file_mtime)
+    else:
+        fn_dt = extract_filename_datetime(file_path.name, file_mtime)
+        if fn_dt is not None:
+            utc_iso = fn_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            utc_epoch = fn_dt.timestamp()
+            date_source = "filename"
+        else:
+            mtime_dt = datetime.fromtimestamp(file_mtime, tz=local_tz()).astimezone(timezone.utc)
+            utc_iso = mtime_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            utc_epoch = mtime_dt.timestamp()
+            date_source = "mtime"
+
+    needs_convert, reason = classify_image(file_path.suffix)
+    thumb_ok = extract_image_thumbnail(
+        file_path,
+        thumb_path,
+        ffmpeg_bin=ffmpeg_bin,
+        max_dim=320,
+        quality=5,
+    )
+
+    user_rotation = int(prev.get("user_rotation", 0)) if prev else 0
+    if user_rotation not in VALID_ROTATIONS:
+        user_rotation = 0
+    delete_flag = bool(prev.get("delete", False)) if prev else False
+    convert_flag = bool(prev["convert"]) if (prev and "convert" in prev) else needs_convert
+    if user_rotation != 0:
+        convert_flag = True
+    reviewed = bool(prev.get("reviewed", False)) if prev else False
+    status = prev.get("status", "pending") if prev else "pending"
+    if prev and prev.get("size_bytes") != file_size:
+        status = "pending"
+
+    return {
+        "id": item_id,
+        "media_type": "image",
+        "rel_path": rel_posix,
+        "filename": file_path.name,
+        "ext": file_path.suffix.lower(),
+        "size_bytes": file_size,
+        "mtime_epoch": file_mtime,
+        "duration": 0.0,
+        "width": width,
+        "height": height,
+        "video_codec": file_path.suffix.lstrip(".").lower() or "image",
+        "audio_codec": "",
+        "has_audio": False,
+        "meta_rotation": meta_rotation,
+        "best_date_utc": utc_iso,
+        "best_date_epoch": utc_epoch,
+        "date_source": date_source,
+        "needs_convert": needs_convert,
+        "reason": reason,
+        "user_rotation": user_rotation,
+        "convert": convert_flag,
+        "delete": delete_flag,
+        "reviewed": reviewed,
+        "status": status,
+        "thumb": thumb_rel if thumb_ok else "",
+        "thumb_offset_idx": 0,
         "probe_error": probe_error,
     }
 
@@ -883,8 +1484,9 @@ def run_scan_job(
     ffprobe_bin: str = "ffprobe",
     progress_cb: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    include_images: bool = True,
 ) -> dict[str, Any]:
-    """Scan source_dir, probe codecs/dates, extract thumbnails, and write plan.json."""
+    """Scan source_dir for videos (and optionally images), extract thumbnails, and write plan.json."""
     thumbs_dir = work_dir / "thumbs"
     thumbs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -901,41 +1503,46 @@ def run_scan_job(
         except Exception as exc:
             print(f"[경고] 기존 plan.json 읽기 실패 (새로 생성합니다): {exc}", file=sys.stderr)
 
-    files = find_video_files(source_dir, work_dir)
+    files = find_media_files(source_dir, work_dir, include_images=include_images)
     total = len(files)
 
     if total == 0:
         plan_data = {
-            "version": 1,
+            "version": 2,
             "source_dir": str(source_dir),
             "work_dir": str(work_dir),
+            "include_images": include_images,
             "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "items": [],
             "merge_groups": [],
         }
         atomic_write_json(plan_path, plan_data)
         if progress_cb:
-            progress_cb(0, 0, "발견된 영상 파일이 없습니다.")
+            progress_cb(0, 0, "발견된 영상/이미지 파일이 없습니다.")
         return plan_data
 
+    vid_cnt = sum(1 for _, mt in files if mt == "video")
+    img_cnt = total - vid_cnt
     items: list[dict[str, Any]] = []
     done_count = 0
     if progress_cb:
-        progress_cb(0, total, f"영상 {total}개 스캔을 시작합니다...")
+        progress_cb(0, total, f"영상 {vid_cnt}개 · 이미지 {img_cnt}개 스캔을 시작합니다...")
 
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-        futures = {
-            pool.submit(
-                scan_single_video,
+        futures = {}
+        for fpath, media_type in files:
+            fn = scan_single_image if media_type == "image" else scan_single_video
+            fut = pool.submit(
+                fn,
                 fpath,
                 source_dir,
                 thumbs_dir,
                 existing_by_rel,
                 ffmpeg_bin,
                 ffprobe_bin,
-            ): fpath
-            for fpath in files
-        }
+            )
+            futures[fut] = fpath
+
         for fut in as_completed(futures):
             if cancel_event and cancel_event.is_set():
                 for pending_f in futures:
@@ -948,11 +1555,16 @@ def run_scan_job(
                 progress_cb(done_count, total, item["filename"])
 
     items.sort(key=lambda x: x["rel_path"].lower())
-    pruned_groups = prune_merge_groups(existing_merge_groups, {x["id"] for x in items})
+    valid_merge_ids = {
+        x["id"] for x in items
+        if x.get("media_type", "video") == "video" and not x.get("delete")
+    }
+    pruned_groups = prune_merge_groups(existing_merge_groups, valid_merge_ids)
     plan_data = {
-        "version": 1,
+        "version": 2,
         "source_dir": str(source_dir),
         "work_dir": str(work_dir),
+        "include_images": include_images,
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "items": items,
         "merge_groups": pruned_groups,
@@ -970,14 +1582,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return 1
 
     work_dir = Path(args.work_dir).expanduser().resolve() if args.work_dir else (source_dir / "_gphotos_work")
+    include_images = not bool(getattr(args, "no_images", False))
     print(f"스캔 대상 폴더: {source_dir}")
     print(f"작업 폴더:      {work_dir}")
+    print(f"이미지 포함:    {'예' if include_images else '아니오 (--no-images)'}")
 
     def on_progress(done: int, total: int, msg: str) -> None:
         if done == 0 and total > 0:
-            print(f"발견된 영상 파일: {total}개")
+            print(msg)
         elif total == 0:
-            print("발견된 영상 파일: 0개")
+            print("발견된 영상/이미지 파일: 0개")
         elif done % 20 == 0 or done == total:
             print(f"  진행률: {done}/{total} ({msg})")
 
@@ -988,18 +1602,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
         ffmpeg_bin=ffmpeg_bin,
         ffprobe_bin=ffprobe_bin,
         progress_cb=on_progress,
+        include_images=include_images,
     )
     items = plan_data.get("items", [])
     if not items:
         return 0
 
+    vid_cnt = sum(1 for x in items if x.get("media_type", "video") == "video")
+    img_cnt = sum(1 for x in items if x.get("media_type") == "image")
     convert_cnt = sum(1 for x in items if x["convert"])
     missing_date_cnt = sum(1 for x in items if x["date_source"] != "metadata")
     print("\n=== 스캔 완료 ===")
-    print(f"전체 영상:         {len(items)}개")
-    print(f"MP4 변환 예정:     {convert_cnt}개 (구형 포맷/코덱)")
+    print(f"전체 항목:         {len(items)}개 (동영상 {vid_cnt} · 이미지 {img_cnt})")
+    print(f"변환/정리 예정:    {convert_cnt}개 (구형 포맷/코덱)")
     print(f"날짜 메타데이터 없음: {missing_date_cnt}개 (파일명/수정일로 보완 예정)")
-    print(f"\n다음 단계: 아래 명령으로 브라우저에서 돌아간 영상을 체크하세요:")
+    print(f"\n다음 단계: 아래 명령으로 브라우저에서 미리보기/회전/삭제/병합을 진행하세요:")
     print(f'  python "{Path(__file__).name}" review --work-dir "{work_dir}"')
     return 0
 
@@ -1009,7 +1626,7 @@ APP_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Google Photos 옛날 영상 정리 마법사</title>
+<title>Google Photos 옛날 사진·영상 정리 마법사</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -1445,6 +2062,8 @@ APP_HTML = r"""<!DOCTYPE html>
     transition: border-color 0.15s;
   }
   .card.rotated { border-color: var(--orange); box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.35); }
+  .card.deleted { border-color: var(--red); box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.4); }
+  .card.deleted .thumb-stage img { opacity: 0.42; filter: grayscale(70%); }
   .thumb-stage {
     width: 100%;
     height: 220px;
@@ -1461,6 +2080,7 @@ APP_HTML = r"""<!DOCTYPE html>
     object-fit: contain;
     transition: transform 0.2s ease;
     border-radius: 4px;
+    cursor: zoom-in;
   }
   .merge-select-box {
     position: absolute;
@@ -1477,13 +2097,41 @@ APP_HTML = r"""<!DOCTYPE html>
     font-size: 11px;
     cursor: pointer;
   }
-  .rot-badge {
+  .badges-top-right {
     position: absolute;
     top: 8px;
     right: 8px;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+  }
+  .rot-badge {
     background: rgba(245, 158, 11, 0.92);
     color: #111;
     font-weight: 700;
+    font-size: 11px;
+    padding: 3px 7px;
+    border-radius: 6px;
+  }
+  .del-badge {
+    background: rgba(239, 68, 68, 0.94);
+    color: #fff;
+    font-weight: 700;
+    font-size: 11px;
+    padding: 3px 7px;
+    border-radius: 6px;
+  }
+  .media-badge {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    z-index: 3;
+    background: rgba(15, 17, 23, 0.88);
+    border: 1px solid var(--border);
+    color: #e2e8f0;
+    font-weight: 600;
     font-size: 11px;
     padding: 3px 7px;
     border-radius: 6px;
@@ -1492,6 +2140,7 @@ APP_HTML = r"""<!DOCTYPE html>
     position: absolute;
     bottom: 8px;
     left: 8px;
+    z-index: 3;
     background: rgba(124, 58, 237, 0.92);
     color: #fff;
     font-weight: 700;
@@ -1499,6 +2148,125 @@ APP_HTML = r"""<!DOCTYPE html>
     padding: 3px 7px;
     border-radius: 6px;
   }
+  .media-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .media-tab {
+    background: var(--panel);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 7px 14px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .media-tab.active {
+    background: rgba(79, 140, 255, 0.18);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .btn-del-active {
+    background: rgba(239, 68, 68, 0.22) !important;
+    border-color: var(--red) !important;
+    color: #fecaca !important;
+    font-weight: 700;
+  }
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(6, 8, 13, 0.95);
+    display: none;
+    flex-direction: column;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(15, 17, 23, 0.95);
+  }
+  .modal-stage {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px 64px;
+    overflow: hidden;
+  }
+  .modal-img-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    max-width: 100%;
+    max-height: 100%;
+  }
+  .modal-img-wrap img {
+    max-width: 82vw;
+    max-height: 72vh;
+    object-fit: contain;
+    border-radius: 6px;
+    transition: transform 0.2s ease;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.65);
+  }
+  .modal-img-wrap img.rot90 {
+    max-width: min(72vw, 72vh);
+    max-height: min(72vw, 72vh);
+  }
+  .modal-img-wrap.deleted img {
+    opacity: 0.45;
+    filter: grayscale(70%);
+  }
+  .modal-deleted-overlay {
+    position: absolute;
+    padding: 8px 16px;
+    border-radius: 8px;
+    background: rgba(185, 28, 28, 0.92);
+    color: #fff;
+    font-weight: 700;
+    font-size: 15px;
+    pointer-events: none;
+  }
+  .modal-nav {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 4;
+    background: rgba(24, 28, 38, 0.88);
+    color: #fff;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    width: 44px;
+    height: 44px;
+    font-size: 18px;
+    cursor: pointer;
+  }
+  .modal-nav:hover:not(:disabled) { border-color: var(--accent); }
+  .modal-nav:disabled { opacity: 0.3; cursor: not-allowed; }
+  .modal-nav.prev { left: 14px; }
+  .modal-nav.next { right: 14px; }
+  .modal-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+    background: rgba(15, 17, 23, 0.95);
+  }
+  .modal-shortcuts { color: var(--muted); font-size: 12px; }
   .no-thumb { color: var(--muted); font-size: 12px; padding: 12px; text-align: center; }
   .card-body { padding: 12px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
   .fname { font-size: 13px; font-weight: 600; word-break: break-all; line-height: 1.3; }
@@ -1591,14 +2359,14 @@ APP_HTML = r"""<!DOCTYPE html>
 <div class="topbar">
   <div class="topbar-inner">
     <div class="header-top">
-      <h1>Google Photos 옛날 영상 정리 마법사</h1>
+      <h1>Google Photos 옛날 사진·영상 정리 마법사</h1>
       <div id="saveBadge" class="save-badge">준비됨</div>
     </div>
     <div class="stepper">
       <button class="step-tab active" data-step="1"><span class="step-num">1</span>사전 준비 &amp; 폴더 선택</button>
-      <button class="step-tab" data-step="2" disabled><span class="step-num">2</span>영상 편집 (회전/병합)</button>
-      <button class="step-tab" data-step="3" disabled><span class="step-num">3</span>변환 전 확인</button>
-      <button class="step-tab" data-step="4" disabled><span class="step-num">4</span>변환 진행</button>
+      <button class="step-tab" data-step="2" disabled><span class="step-num">2</span>사진·영상 정리 (미리보기/회전/삭제/병합)</button>
+      <button class="step-tab" data-step="3" disabled><span class="step-num">3</span>실행 전 확인</button>
+      <button class="step-tab" data-step="4" disabled><span class="step-num">4</span>작업 진행</button>
     </div>
   </div>
 </div>
@@ -1619,12 +2387,15 @@ APP_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="panel-box">
-      <div class="panel-title"><span>2. HDD 영상 폴더 선택 &amp; 스캔</span></div>
-      <div class="muted">구형 영상이 들어 있는 폴더 경로(예: <code>D:\OldPhotos</code>)를 입력하거나 폴더 찾기를 누르세요.</div>
+      <div class="panel-title"><span>2. HDD 사진·영상 폴더 선택 &amp; 스캔</span></div>
+      <div class="muted">정리할 사진·영상이 들어 있는 폴더 경로(예: <code>D:\OldPhotos</code>)를 입력하거나 폴더 찾기를 누르세요.</div>
       <div class="folder-row">
         <input id="sourceDirInput" class="text-input" type="text" placeholder="예: D:\OldPhotos" />
         <button id="browseBtn" class="btn">📂 폴더 찾기</button>
-        <button id="startScanBtn" class="btn btn-accent">🔍 영상 스캔 시작</button>
+        <button id="startScanBtn" class="btn btn-accent">🔍 사진·영상 스캔 시작</button>
+      </div>
+      <div style="margin-top:10px;font-size:13px;">
+        <label class="chk-label"><input type="checkbox" id="optIncludeImages" checked /> <span>이미지 파일도 함께 스캔 (사진 크게 보기 · 회전 · 불필요한 파일 삭제 정리)</span></label>
       </div>
       <div id="existingPlanBox" class="alert-info" style="display:none;"></div>
 
@@ -1643,8 +2414,10 @@ APP_HTML = r"""<!DOCTYPE html>
   <section id="step2" class="step-view">
     <div class="panel-title" style="margin-bottom:10px;">
       <div id="statsBar" class="stats-bar" style="margin-bottom:0;"></div>
-      <button id="goStep3Btn" class="btn btn-accent">다음: 변환 전 작업 내용 확인 →</button>
+      <button id="goStep3Btn" class="btn btn-accent">다음: 실행 전 작업 내용 확인 →</button>
     </div>
+
+    <div id="mediaTabs" class="media-tabs"></div>
 
     <div class="controls">
       <div id="filterPills" class="filters"></div>
@@ -1653,7 +2426,9 @@ APP_HTML = r"""<!DOCTYPE html>
 
     <div class="merge-toolbar">
       <div class="merge-toolbar-group">
-        <span>병합 선택: <strong id="selectedCount">0</strong>개 (같은 페이지 Shift+클릭 범위 선택 / 페이지 이동 후 이어 선택 가능)</span>
+        <span>선택: <strong id="selectedCount">0</strong>개 (Shift+클릭 범위 선택 / 페이지 이동 후 이어 선택 가능)</span>
+        <button id="batchDeleteBtn" class="btn btn-danger" disabled>🗑 선택 삭제 표시</button>
+        <button id="batchUndeleteBtn" class="btn" disabled>↩ 선택 삭제 해제</button>
         <button id="createMergeBtn" class="btn btn-primary" disabled>🔗 선택한 영상 병합 그룹 만들기</button>
         <button id="clearSelectBtn" class="btn">선택 해제</button>
       </div>
@@ -1677,14 +2452,14 @@ APP_HTML = r"""<!DOCTYPE html>
           <input type="radio" name="convMode" value="output" checked style="margin-top:3px;" />
           <div>
             <div style="font-weight:700;font-size:15px;">🛡️ 세이프 모드 (원본 100% 유지)</div>
-            <div class="muted" style="margin-top:4px;">원본 파일은 전혀 건드리지 않고, 변환·병합된 MP4 파일만 <code>_gphotos_work\converted\</code> 폴더에 따로 저장합니다.</div>
+            <div class="muted" style="margin-top:4px;">원본 파일은 전혀 건드리지 않고, 변환·회전된 영상(MP4)·이미지 결과물만 <code>_gphotos_work\converted\</code> 폴더에 따로 저장합니다. <em>(삭제 표시는 원본에 적용되지 않습니다)</em></div>
           </div>
         </label>
         <label class="mode-card" id="modeCardReplace">
           <input type="radio" name="convMode" value="replace-backup" style="margin-top:3px;" />
           <div>
             <div style="font-weight:700;font-size:15px;">📦 원본 백업 후 교체 모드 (업로드 최적화)</div>
-            <div class="muted" style="margin-top:4px;">원본(분할 클립 포함)은 <code>_gphotos_work\original_backup\</code>으로 안전하게 옮기고, 변환·병합된 MP4를 원래 폴더 자리에 배치합니다.</div>
+            <div class="muted" style="margin-top:4px;">변환·회전 원본은 <code>_gphotos_work\original_backup\</code>, 삭제 표시 파일은 <code>_gphotos_work\deleted_trash\</code>로 안전하게 옮기고, 정리된 결과물을 원래 폴더 자리에 배치합니다.</div>
           </div>
         </label>
       </div>
@@ -1692,7 +2467,7 @@ APP_HTML = r"""<!DOCTYPE html>
       <div style="display:flex;flex-wrap:wrap;gap:16px;margin-top:14px;align-items:center;font-size:13px;">
         <label class="chk-label"><input type="checkbox" id="optFixDates" /> <span>촬영일 메타데이터가 없는 정상 MP4/MOV에도 무손실로 날짜 기록</span></label>
         <label class="chk-label"><input type="checkbox" id="optRetryFailed" /> <span>이전에 실패했던 항목 재시도</span></label>
-        <label>화질(CRF):
+        <label>영상 화질(CRF):
           <select id="optCrf" class="gap-input" style="width:auto;">
             <option value="18">18 (고화질)</option>
             <option value="20" selected>20 (표준 추천)</option>
@@ -1704,15 +2479,16 @@ APP_HTML = r"""<!DOCTYPE html>
 
     <div class="panel-box">
       <div class="panel-title">
-        <span>2. 변환 전 작업 내용 리뷰</span>
+        <span>2. 실행 전 작업 내용 리뷰</span>
         <button id="refreshPreviewBtn" class="btn">🔄 목록 새로고침</button>
       </div>
+      <div id="deleteSafeWarn" class="alert-warn" style="display:none;margin-bottom:12px;"></div>
       <div id="previewStats" class="stats-bar"></div>
       <div id="previewList" class="preview-list"></div>
 
       <div class="action-footer">
         <button id="backToStep2Btn" class="btn">← 편집 화면으로</button>
-        <button id="startConvertBtn" class="btn btn-green">🚀 변환 시작하기</button>
+        <button id="startConvertBtn" class="btn btn-green">🚀 정리/변환 시작하기</button>
       </div>
     </div>
   </section>
@@ -1721,7 +2497,7 @@ APP_HTML = r"""<!DOCTYPE html>
   <section id="step4" class="step-view">
     <div class="panel-box">
       <div class="panel-title">
-        <span id="convertTitle">변환 진행 상태</span>
+        <span id="convertTitle">작업 진행 상태</span>
         <button id="cancelConvertBtn" class="btn btn-danger" style="display:none;">⏹ 현재 작업 후 안전 중단</button>
       </div>
       <div id="convertCurrentLabel" class="muted">대기 중...</div>
@@ -1733,6 +2509,7 @@ APP_HTML = r"""<!DOCTYPE html>
         <div style="display:flex;flex-wrap:wrap;gap:8px;">
           <button id="openOutputFolderBtn" class="btn btn-accent">📂 결과 폴더 열기</button>
           <button id="openBackupFolderBtn" class="btn" style="display:none;">📂 원본 백업 폴더 열기</button>
+          <button id="openTrashFolderBtn" class="btn" style="display:none;">📂 삭제 휴지통 폴더 열기</button>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:8px;">
           <button id="step4BackEditBtn" class="btn">← 편집 화면으로</button>
@@ -1743,12 +2520,47 @@ APP_HTML = r"""<!DOCTYPE html>
   </section>
 </main>
 
+<!-- PREVIEW LIGHTBOX MODAL -->
+<div id="previewModal" class="modal-backdrop" role="dialog" aria-modal="true">
+  <div class="modal-header">
+    <div>
+      <div id="modalTitle" style="font-weight:700;font-size:15px;"></div>
+      <div id="modalSub" class="muted" style="font-size:12px;margin-top:2px;"></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span id="modalIndex" class="muted"></span>
+      <button id="modalCloseBtn" class="btn">✕ 닫기 (Esc)</button>
+    </div>
+  </div>
+  <div class="modal-stage">
+    <button id="modalPrevBtn" class="modal-nav prev" title="이전 (←)">◀</button>
+    <div id="modalImgWrap" class="modal-img-wrap">
+      <img id="modalImg" src="" alt="" />
+      <div id="modalDeletedOverlay" class="modal-deleted-overlay" style="display:none;">🗑 삭제 예정 (휴지통 이동 대상)</div>
+    </div>
+    <button id="modalNextBtn" class="modal-nav next" title="다음 (→)">▶</button>
+  </div>
+  <div class="modal-footer">
+    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+      <button id="modalRotCCW" class="btn">↺ 90° (L)</button>
+      <button id="modalRotCW" class="btn">↻ 90° (R)</button>
+      <button id="modalRot180" class="btn">↕ 180°</button>
+      <button id="modalRotReset" class="btn">초기화 (0)</button>
+      <button id="modalDelBtn" class="btn">🗑 삭제 표시 (D)</button>
+      <button id="modalRethumbBtn" class="btn" style="display:none;">🖼 다른장면</button>
+      <button id="modalOpenOsBtn" class="btn">📂 기본 앱으로 열기</button>
+    </div>
+    <div class="modal-shortcuts">단축키: ←/→ 이동 · L/R 회전 · 0 초기화 · D/Del 삭제 토글 · Esc 닫기</div>
+  </div>
+</div>
+
 <script>
 const PAGE_SIZE = 60;
 let appState = { has_plan: false, source_dir: '', work_dir: '', initial_step: 1 };
 let envStatus = { ready: false };
 let plan = { items: [], merge_groups: [] };
 let currentStep = 1;
+let mediaFilter = 'all';
 let currentFilter = 'all';
 let searchQuery = '';
 let currentPage = 1;
@@ -1757,11 +2569,13 @@ let lastClickedId = null;
 let mergePanelCollapsed = false;
 let scanPollTimer = null;
 let convertPollTimer = null;
+let modalItemId = null;
 
 const FILTERS = [
   { key: 'all', label: '전체' },
-  { key: 'convert', label: '변환 예정' },
+  { key: 'convert', label: '변환/회전 예정' },
   { key: 'rotated', label: '회전 지정됨' },
+  { key: 'deleted', label: '🗑 삭제 예정' },
   { key: 'merged', label: '병합 그룹' },
   { key: 'legacy', label: '구형 포맷/코덱' },
   { key: 'keep', label: '정상 유지' },
@@ -1809,6 +2623,7 @@ function goStep(step) {
   if (step === 2) {
     refreshPlan().then(() => {
       renderStats();
+      renderMediaTabs();
       renderMergePanel();
       renderGrid();
     });
@@ -1892,7 +2707,7 @@ async function checkFolderInput() {
   if (data.has_existing_plan) {
     box.style.display = 'flex';
     box.innerHTML = `
-      <span>✅ 이전 스캔 기록을 발견했습니다! (영상 <strong>${data.existing_count}</strong>개 · 작업 폴더: <code>${escapeHtml(data.work_dir)}</code>)</span>
+      <span>✅ 이전 스캔 기록을 발견했습니다! (항목 <strong>${data.existing_count}</strong>개 · 작업 폴더: <code>${escapeHtml(data.work_dir)}</code>)</span>
       <button class="btn btn-accent" id="loadExistingBtn">📂 기존 검수 이어하기 →</button>
     `;
     document.getElementById('loadExistingBtn').onclick = () => loadExistingPlan(sourceDir);
@@ -1932,11 +2747,12 @@ async function browseFolder() {
 
 async function startScan() {
   const sourceDir = document.getElementById('sourceDirInput').value.trim();
-  if (!sourceDir) { alert('영상 폴더 경로를 입력하세요.'); return; }
+  if (!sourceDir) { alert('사진·영상 폴더 경로를 입력하세요.'); return; }
+  const includeImages = document.getElementById('optIncludeImages').checked;
   const res = await fetch('/api/scan/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source_dir: sourceDir })
+    body: JSON.stringify({ source_dir: sourceDir, include_images: includeImages })
   });
   const data = await res.json();
   if (!res.ok) { alert(data.error || '스캔 시작 실패'); return; }
@@ -1953,7 +2769,7 @@ async function pollScanStatus() {
   document.getElementById('scanProgressFill').style.width = pct + '%';
   document.getElementById('scanProgressText').textContent =
     st.status === 'running' ? `스캔 중: ${st.done} / ${st.total} (${st.current_file || ''})` :
-    st.status === 'done' ? `스캔 완료: 총 ${st.total}개 영상` :
+    st.status === 'done' ? `스캔 완료: 총 ${st.total}개 항목` :
     st.status === 'cancelled' ? '스캔 중단됨' :
     st.status === 'error' ? `오류: ${st.error}` : '';
 
@@ -1984,12 +2800,18 @@ function getMergeMembership() {
 }
 
 function matchesFilter(item, membership) {
-  if (currentFilter === 'convert' && !item.convert && !membership[item.id]) return false;
-  if (currentFilter === 'rotated' && item.user_rotation === 0) return false;
-  if (currentFilter === 'merged' && !membership[item.id]) return false;
-  if (currentFilter === 'legacy' && !item.needs_convert) return false;
-  if (currentFilter === 'keep' && (item.convert || membership[item.id])) return false;
-  if (currentFilter === 'nodate' && item.date_source === 'metadata') return false;
+  const mType = item.media_type || 'video';
+  if (mediaFilter !== 'all' && mType !== mediaFilter) return false;
+  if (currentFilter === 'deleted') {
+    if (!item.delete) return false;
+  } else {
+    if (currentFilter === 'convert' && (item.delete || (!item.convert && !membership[item.id]))) return false;
+    if (currentFilter === 'rotated' && (item.delete || item.user_rotation === 0)) return false;
+    if (currentFilter === 'merged' && !membership[item.id]) return false;
+    if (currentFilter === 'legacy' && !item.needs_convert) return false;
+    if (currentFilter === 'keep' && (item.delete || item.convert || membership[item.id])) return false;
+    if (currentFilter === 'nodate' && item.date_source === 'metadata') return false;
+  }
   if (searchQuery) {
     const q = searchQuery.toLowerCase();
     if (!item.rel_path.toLowerCase().includes(q)) return false;
@@ -1997,20 +2819,53 @@ function matchesFilter(item, membership) {
   return true;
 }
 
+function getFilteredItems() {
+  const membership = getMergeMembership();
+  return (plan.items || []).filter(it => matchesFilter(it, membership));
+}
+
+function renderMediaTabs() {
+  const items = plan.items || [];
+  const total = items.length;
+  const vidCnt = items.filter(x => (x.media_type || 'video') === 'video').length;
+  const imgCnt = items.filter(x => x.media_type === 'image').length;
+  const tabs = [
+    { key: 'all', label: `전체 (${total})` },
+    { key: 'video', label: `🎬 동영상 (${vidCnt})` },
+    { key: 'image', label: `🖼 이미지 (${imgCnt})` }
+  ];
+  const wrap = document.getElementById('mediaTabs');
+  wrap.innerHTML = '';
+  for (const t of tabs) {
+    const btn = document.createElement('button');
+    btn.className = 'media-tab' + (mediaFilter === t.key ? ' active' : '');
+    btn.textContent = t.label;
+    btn.onclick = () => {
+      mediaFilter = t.key;
+      currentPage = 1;
+      renderMediaTabs();
+      renderGrid();
+    };
+    wrap.appendChild(btn);
+  }
+}
+
 function renderStats() {
   const items = plan.items || [];
   const groups = plan.merge_groups || [];
   const total = items.length;
-  const convertCnt = items.filter(x => x.convert).length;
-  const rotCnt = items.filter(x => x.user_rotation !== 0).length;
-  const legacyCnt = items.filter(x => x.needs_convert).length;
+  const vidCnt = items.filter(x => (x.media_type || 'video') === 'video').length;
+  const imgCnt = items.filter(x => x.media_type === 'image').length;
+  const convertCnt = items.filter(x => !x.delete && x.convert).length;
+  const rotCnt = items.filter(x => !x.delete && x.user_rotation !== 0).length;
+  const delCnt = items.filter(x => x.delete).length;
   const noDateCnt = items.filter(x => x.date_source !== 'metadata').length;
   document.getElementById('statsBar').innerHTML = `
-    <div class="stat-chip">전체 <strong>${total}</strong></div>
-    <div class="stat-chip">변환 예정 <strong>${convertCnt}</strong></div>
+    <div class="stat-chip">전체 <strong>${total}</strong> (영상 ${vidCnt} · 사진 ${imgCnt})</div>
+    <div class="stat-chip">변환/회전 <strong>${convertCnt}</strong></div>
     <div class="stat-chip">회전 지정 <strong>${rotCnt}</strong></div>
+    <div class="stat-chip" style="${delCnt > 0 ? 'border-color:rgba(239,68,68,0.6);color:#fecaca;' : ''}">삭제 예정 <strong>${delCnt}</strong></div>
     <div class="stat-chip">병합 그룹 <strong>${groups.length}</strong></div>
-    <div class="stat-chip">구형 포맷/코덱 <strong>${legacyCnt}</strong></div>
     <div class="stat-chip">촬영일 추정 <strong>${noDateCnt}</strong></div>
   `;
 }
@@ -2034,7 +2889,12 @@ function renderFilters() {
 
 function updateSelectionUI() {
   document.getElementById('selectedCount').textContent = String(selectedIds.length);
-  document.getElementById('createMergeBtn').disabled = selectedIds.length < 2;
+  const byId = {};
+  (plan.items || []).forEach(it => { byId[it.id] = it; });
+  const selectedVideos = selectedIds.filter(id => byId[id] && (byId[id].media_type || 'video') === 'video' && !byId[id].delete);
+  document.getElementById('createMergeBtn').disabled = selectedVideos.length < 2;
+  document.getElementById('batchDeleteBtn').disabled = selectedIds.length === 0;
+  document.getElementById('batchUndeleteBtn').disabled = selectedIds.length === 0;
 }
 
 async function refreshPlan() {
@@ -2056,8 +2916,40 @@ async function updateItem(id, patch) {
     const data = await res.json();
     const idx = plan.items.findIndex(x => x.id === id);
     if (idx >= 0) plan.items[idx] = data.item;
+    if (Array.isArray(data.merge_groups)) plan.merge_groups = data.merge_groups;
     setSaveStatus('자동 저장됨', false);
     renderStats();
+    renderMediaTabs();
+    updateSelectionUI();
+    renderMergePanel();
+    renderGrid();
+    if (modalItemId === id) renderPreviewModal();
+  } catch (err) {
+    setSaveStatus('저장 오류!', true);
+  }
+}
+
+async function batchUpdateItems(itemIds, patch) {
+  if (!itemIds || itemIds.length === 0) return;
+  setSaveStatus('일괄 저장 중...', false);
+  try {
+    const res = await fetch('/api/batch-update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ item_ids: itemIds, ...patch })
+    });
+    if (!res.ok) throw new Error('저장 실패');
+    const data = await res.json();
+    const updatedMap = {};
+    (data.items || []).forEach(it => { updatedMap[it.id] = it; });
+    plan.items = (plan.items || []).map(it => updatedMap[it.id] || it);
+    if (Array.isArray(data.merge_groups)) plan.merge_groups = data.merge_groups;
+    selectedIds = [];
+    lastClickedId = null;
+    updateSelectionUI();
+    setSaveStatus(`자동 저장됨 (${data.updated}개)`, false);
+    renderStats();
+    renderMediaTabs();
     renderMergePanel();
     renderGrid();
   } catch (err) {
@@ -2255,6 +3147,10 @@ async function rethumb(id) {
     if (data.thumb_url) {
       const img = document.getElementById('img-' + id);
       if (img) img.src = data.thumb_url;
+      if (modalItemId === id) {
+        const mImg = document.getElementById('modalImg');
+        if (mImg) mImg.src = data.thumb_url;
+      }
     }
     setSaveStatus('자동 저장됨', false);
   } catch (e) {
@@ -2291,7 +3187,7 @@ function toggleSelectItem(id, checked, shiftKey, pageIds) {
 
 function renderGrid() {
   const membership = getMergeMembership();
-  const filtered = (plan.items || []).filter(it => matchesFilter(it, membership));
+  const filtered = getFilteredItems();
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   if (currentPage > totalPages) currentPage = totalPages;
   const start = (currentPage - 1) * PAGE_SIZE;
@@ -2302,38 +3198,50 @@ function renderGrid() {
   grid.innerHTML = '';
 
   if (pageItems.length === 0) {
-    grid.innerHTML = '<div style="color:#9aa4b8;padding:30px;">조건에 맞는 영상이 없습니다.</div>';
+    grid.innerHTML = '<div style="color:#9aa4b8;padding:30px;">조건에 맞는 항목이 없습니다.</div>';
   }
 
   for (const item of pageItems) {
+    const isImage = item.media_type === 'image';
+    const isDeleted = Boolean(item.delete);
     const card = document.createElement('div');
-    card.className = 'card' + (item.user_rotation ? ' rotated' : '');
+    card.className = 'card' + (isDeleted ? ' deleted' : (item.user_rotation ? ' rotated' : ''));
 
     const dateBadgeClass = item.date_source === 'metadata' ? 'ok' : 'warn';
-    const dateLabel = item.date_source === 'metadata' ? '메타' : (item.date_source === 'filename' ? '파일명' : '수정일');
+    const dateLabel = item.date_source === 'metadata' ? (isImage ? 'EXIF' : '메타') : (item.date_source === 'filename' ? '파일명' : '수정일');
     const isSel = selectedIds.includes(item.id);
     const mem = membership[item.id];
     const thumbHtml = item.thumb
-      ? `<img id="img-${item.id}" src="/${item.thumb}" style="transform: rotate(${item.user_rotation}deg);" loading="lazy" alt="" />`
-      : `<div class="no-thumb">썸네일 없음<br/>${item.probe_error || ''}</div>`;
+      ? `<img id="img-${item.id}" src="/${item.thumb}" style="transform: rotate(${item.user_rotation}deg);" loading="lazy" title="클릭하여 크게 보기" alt="" />`
+      : (isImage
+          ? `<img id="img-${item.id}" src="/preview/${item.id}" style="transform: rotate(${item.user_rotation}deg);" loading="lazy" title="클릭하여 크게 보기" alt="" />`
+          : `<div class="no-thumb">썸네일 없음<br/>${escapeHtml(item.probe_error || '')}</div>`);
+
+    const dimTag = (item.width && item.height) ? `<span class="tag">${item.width}x${item.height}</span>` : '';
+    const durTag = isImage ? '' : `<span class="tag">${fmtDur(item.duration)}</span>`;
+    const convLabel = isImage ? '변환/저장' : 'MP4 변환';
 
     card.innerHTML = `
       <div class="thumb-stage">
         <label class="merge-select-box">
           <input type="checkbox" class="merge-chk" ${isSel ? 'checked' : ''} />
-          <span>병합</span>
+          <span>선택</span>
         </label>
         ${thumbHtml}
-        ${item.user_rotation ? `<div class="rot-badge">회전 ${item.user_rotation}°</div>` : ''}
+        <div class="badges-top-right">
+          ${isDeleted ? `<div class="del-badge">🗑 삭제 예정</div>` : ''}
+          ${item.user_rotation ? `<div class="rot-badge">회전 ${item.user_rotation}°</div>` : ''}
+        </div>
         ${mem ? `<div class="merge-badge">🔗 병합 #${mem.groupNum} (${mem.pos}/${mem.total})</div>` : ''}
+        <div class="media-badge">${isImage ? '🖼 사진' : '🎬 영상'}</div>
       </div>
       <div class="card-body">
         <div class="fname">${escapeHtml(item.filename)}</div>
         <div class="fpath">${escapeHtml(item.rel_path)}</div>
         <div class="meta-row">
           <span class="tag ${item.needs_convert ? 'warn' : 'ok'}">${escapeHtml(item.reason)}</span>
-          <span class="tag">${item.width}x${item.height}</span>
-          <span class="tag">${fmtDur(item.duration)}</span>
+          ${dimTag}
+          ${durTag}
           <span class="tag">${fmtSize(item.size_bytes)}</span>
           <span class="tag ${dateBadgeClass}">${dateLabel}: ${fmtDate(item.best_date_utc)}</span>
         </div>
@@ -2346,15 +3254,20 @@ function renderGrid() {
         <div class="card-actions">
           <label class="chk-label">
             <input type="checkbox" class="conv-chk" ${item.convert ? 'checked' : ''} />
-            <span>MP4 변환</span>
+            <span>${convLabel}</span>
           </label>
           <div class="mini-btns">
-            <button class="btn btn-rethumb" title="다른 시점 썸네일 추출">🖼 다른장면</button>
-            <button class="btn btn-open" title="로컬 플레이어로 열기">▶ 재생</button>
+            <button class="btn btn-del-toggle ${isDeleted ? 'btn-del-active' : ''}" title="휴지통으로 이동 표시">${isDeleted ? '↩ 취소' : '🗑 삭제'}</button>
+            <button class="btn btn-zoom" title="크게 미리보기">🔍</button>
+            ${isImage ? '' : '<button class="btn btn-rethumb" title="다른 시점 썸네일 추출">🖼</button>'}
+            <button class="btn btn-open" title="로컬 기본 앱으로 열기">${isImage ? '📂' : '▶'}</button>
           </div>
         </div>
       </div>
     `;
+
+    const thumbImg = card.querySelector('.thumb-stage img');
+    if (thumbImg) thumbImg.onclick = () => openPreviewModal(item.id);
 
     const mChk = card.querySelector('.merge-chk');
     mChk.onclick = (e) => toggleSelectItem(item.id, mChk.checked, e.shiftKey, pageIds);
@@ -2364,7 +3277,10 @@ function renderGrid() {
     });
     const chk = card.querySelector('.conv-chk');
     chk.onchange = () => updateItem(item.id, { convert: chk.checked, reviewed: true });
-    card.querySelector('.btn-rethumb').onclick = () => rethumb(item.id);
+    card.querySelector('.btn-del-toggle').onclick = () => updateItem(item.id, { delete: !isDeleted, reviewed: true });
+    card.querySelector('.btn-zoom').onclick = () => openPreviewModal(item.id);
+    const rethumbBtn = card.querySelector('.btn-rethumb');
+    if (rethumbBtn) rethumbBtn.onclick = () => rethumb(item.id);
     card.querySelector('.btn-open').onclick = () => openVideo(item.id);
 
     grid.appendChild(card);
@@ -2392,6 +3308,80 @@ function renderGrid() {
   }
 }
 
+/* LIGHTBOX PREVIEW MODAL */
+function openPreviewModal(itemId) {
+  modalItemId = itemId;
+  document.getElementById('previewModal').classList.add('open');
+  renderPreviewModal();
+}
+
+function closePreviewModal() {
+  modalItemId = null;
+  document.getElementById('previewModal').classList.remove('open');
+}
+
+function renderPreviewModal() {
+  if (!modalItemId) return;
+  const filtered = getFilteredItems();
+  let idx = filtered.findIndex(x => x.id === modalItemId);
+  let item = idx >= 0 ? filtered[idx] : (plan.items || []).find(x => x.id === modalItemId);
+  if (!item) {
+    closePreviewModal();
+    return;
+  }
+  const isImage = item.media_type === 'image';
+  const isDeleted = Boolean(item.delete);
+  const rot = Number(item.user_rotation || 0);
+
+  document.getElementById('modalTitle').textContent = `${isImage ? '🖼' : '🎬'} ${item.filename}`;
+  document.getElementById('modalSub').textContent =
+    `${item.rel_path} · ${item.width}x${item.height} · ${fmtSize(item.size_bytes)} · ${fmtDate(item.best_date_utc)}` +
+    (rot ? ` · 회전 ${rot}°` : '');
+  document.getElementById('modalIndex').textContent = idx >= 0 ? `${idx + 1} / ${filtered.length}` : '';
+
+  const img = document.getElementById('modalImg');
+  const wantSrc = `/preview/${item.id}`;
+  if (img.dataset.itemId !== item.id) {
+    img.dataset.itemId = item.id;
+    img.src = wantSrc;
+  }
+  img.style.transform = `rotate(${rot}deg)`;
+  img.classList.toggle('rot90', rot === 90 || rot === 270);
+
+  document.getElementById('modalImgWrap').classList.toggle('deleted', isDeleted);
+  document.getElementById('modalDeletedOverlay').style.display = isDeleted ? 'block' : 'none';
+
+  const delBtn = document.getElementById('modalDelBtn');
+  delBtn.textContent = isDeleted ? '↩ 삭제 취소 (D)' : '🗑 삭제 표시 (D)';
+  delBtn.classList.toggle('btn-del-active', isDeleted);
+
+  document.getElementById('modalRethumbBtn').style.display = isImage ? 'none' : 'inline-block';
+  document.getElementById('modalOpenOsBtn').textContent = isImage ? '📂 기본 뷰어로 열기' : '▶ 로컬 플레이어로 재생';
+
+  document.getElementById('modalPrevBtn').disabled = idx <= 0;
+  document.getElementById('modalNextBtn').disabled = idx < 0 || idx >= filtered.length - 1;
+}
+
+function navigateModal(delta) {
+  if (!modalItemId) return;
+  const filtered = getFilteredItems();
+  const idx = filtered.findIndex(x => x.id === modalItemId);
+  if (idx < 0) return;
+  const nextIdx = idx + delta;
+  if (nextIdx >= 0 && nextIdx < filtered.length) {
+    modalItemId = filtered[nextIdx].id;
+    renderPreviewModal();
+  }
+}
+
+function rotateModalBy(deltaDeg) {
+  if (!modalItemId) return;
+  const item = (plan.items || []).find(x => x.id === modalItemId);
+  if (!item) return;
+  const nextRot = (Number(item.user_rotation || 0) + deltaDeg + 360) % 360;
+  updateItem(item.id, { user_rotation: nextRot, reviewed: true });
+}
+
 /* STEP 3 FUNCTIONS */
 function selectedMode() {
   const el = document.querySelector('input[name="convMode"]:checked');
@@ -2416,42 +3406,66 @@ async function loadPreview() {
   if (!res.ok) return;
 
   const s = data.summary;
+  const delWarn = document.getElementById('deleteSafeWarn');
+  if (s.delete_marked_count > 0 && mode === 'output') {
+    delWarn.style.display = 'flex';
+    delWarn.style.alignItems = 'center';
+    delWarn.style.justifyContent = 'space-between';
+    delWarn.style.flexWrap = 'wrap';
+    delWarn.style.gap = '10px';
+    delWarn.innerHTML = `
+      <span>⚠ 현재 <strong>세이프 모드</strong>이므로 삭제 표시한 <strong>${s.delete_marked_count}</strong>개 파일이 원본 폴더에서 지워지지 않습니다. 휴지통(<code>_gphotos_work\\deleted_trash</code>)으로 옮기려면 교체 모드를 선택하세요.</span>
+      <button class="btn btn-accent" id="switchReplaceBtn">📦 원본 백업 후 교체 모드로 전환</button>
+    `;
+    document.getElementById('switchReplaceBtn').onclick = () => {
+      const r = document.querySelector('input[name="convMode"][value="replace-backup"]');
+      if (r) { r.checked = true; loadPreview(); }
+    };
+  } else {
+    delWarn.style.display = 'none';
+  }
+
   document.getElementById('previewStats').innerHTML = `
     <div class="stat-chip">실행 예정 작업 <strong>${s.total_will_run}</strong>건</div>
-    <div class="stat-chip">단독 변환 <strong>${s.standalone_count}</strong>개</div>
+    <div class="stat-chip">영상 변환 <strong>${s.standalone_video_count}</strong>개</div>
+    <div class="stat-chip">이미지 회전/변환 <strong>${s.standalone_image_count}</strong>개</div>
     <div class="stat-chip">병합 그룹 <strong>${s.merge_group_count}</strong>개 (${s.merge_clip_count}클립)</div>
-    <div class="stat-chip">회전 적용 <strong>${s.rotated_count}</strong>개</div>
-    <div class="stat-chip">날짜 보완 <strong>${s.date_fix_count}</strong>개</div>
+    <div class="stat-chip">휴지통 이동(삭제) <strong>${s.delete_will_run_count}</strong>개</div>
     <div class="stat-chip">변경 없이 유지 <strong>${s.keep_count}</strong>개</div>
   `;
 
   const list = document.getElementById('previewList');
   if (!data.items || data.items.length === 0) {
-    list.innerHTML = '<div style="padding:20px;color:#9aa4b8;">변환하거나 병합할 작업이 없습니다. 2단계에서 영상 회전이나 병합을 지정해 주세요.</div>';
+    list.innerHTML = '<div style="padding:20px;color:#9aa4b8;">변환·회전·병합·삭제할 작업이 없습니다. 2단계에서 항목을 편집해 주세요.</div>';
     document.getElementById('startConvertBtn').disabled = true;
     return;
   }
   document.getElementById('startConvertBtn').disabled = s.total_will_run === 0;
-  list.innerHTML = data.items.map(it => `
-    <div class="preview-row">
-      <div>
-        <span class="tag ${it.kind === 'merge' ? 'warn' : 'ok'}" style="margin-right:6px;">
-          ${it.kind === 'merge' ? '🔗 병합' : '🎬 단독'}
-        </span>
-        <strong>${escapeHtml(it.src)}</strong> → <code>${escapeHtml(it.dst)}</code>
+  list.innerHTML = data.items.map(it => {
+    const kindLabel =
+      it.kind === 'merge' ? '🔗 병합' :
+      it.kind === 'image' ? '🖼 이미지' :
+      it.kind === 'delete' ? '🗑 휴지통 이동' : '🎬 영상';
+    const badgeClass = (it.kind === 'merge' || it.kind === 'delete') ? 'warn' : 'ok';
+    return `
+      <div class="preview-row">
+        <div>
+          <span class="tag ${badgeClass}" style="margin-right:6px;">${kindLabel}</span>
+          <strong>${escapeHtml(it.src)}</strong> → <code>${escapeHtml(it.dst)}</code>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <span class="tag">${escapeHtml(it.action_label)}</span>
+          <span class="tag ${it.will_run ? 'ok' : ''}">${it.will_run ? '실행 예정' : escapeHtml(it.skip_reason)}</span>
+        </div>
       </div>
-      <div style="display:flex;gap:6px;align-items:center;">
-        <span class="tag">${escapeHtml(it.action_label)}</span>
-        <span class="tag ${it.will_run ? 'ok' : ''}">${it.will_run ? '실행 예정' : escapeHtml(it.skip_reason)}</span>
-      </div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
 }
 
 async function startConvert(retryFailedOverride) {
   const mode = selectedMode();
   if (mode === 'replace-backup') {
-    if (!confirm('원본 백업 후 교체 모드입니다.\n원본 파일은 _gphotos_work/original_backup 으로 이동하고, 변환/병합된 MP4가 원래 폴더 자리에 저장됩니다.\n계속 진행할까요?')) {
+    if (!confirm('원본 백업 후 교체 모드입니다.\n변환/회전 원본은 _gphotos_work/original_backup 으로, 삭제 표시 파일은 _gphotos_work/deleted_trash 로 이동하고, 정리된 결과물이 원래 폴더 자리에 저장됩니다.\n계속 진행할까요?')) {
       return;
     }
   }
@@ -2468,7 +3482,7 @@ async function startConvert(retryFailedOverride) {
     })
   });
   const data = await res.json();
-  if (!res.ok) { alert(data.error || '변환 시작 실패'); return; }
+  if (!res.ok) { alert(data.error || '작업 시작 실패'); return; }
   appState.convert_job = { status: 'running' };
   updateStepperLocks();
   goStep(4);
@@ -2485,15 +3499,16 @@ async function pollConvertStatus() {
   const pct = st.total_units > 0 ? Math.round((st.done_units / st.total_units) * 100) : (st.status === 'done' ? 100 : 0);
   document.getElementById('convertProgressFill').style.width = pct + '%';
   document.getElementById('convertTitle').textContent =
-    st.status === 'running' ? `변환 진행 중... (${pct}%)` :
-    st.status === 'done' ? '✅ 변환 작업이 완료되었습니다!' :
-    st.status === 'cancelled' ? '⏹ 변환이 안전하게 중단되었습니다' :
-    st.status === 'error' ? '❌ 변환 중 오류가 발생했습니다' : '대기 중';
+    st.status === 'running' ? `작업 진행 중... (${pct}%)` :
+    st.status === 'done' ? '✅ 정리 및 변환 작업이 완료되었습니다!' :
+    st.status === 'cancelled' ? '⏹ 작업이 안전하게 중단되었습니다' :
+    st.status === 'error' ? '❌ 작업 중 오류가 발생했습니다' : '대기 중';
 
   document.getElementById('convertCurrentLabel').textContent = st.current_label || '';
   document.getElementById('convertCounters').innerHTML = `
-    <div class="stat-chip">단독 성공 <strong>${st.converted_cnt}</strong></div>
+    <div class="stat-chip">변환/회전 성공 <strong>${st.converted_cnt}</strong></div>
     <div class="stat-chip">병합 성공 <strong>${st.merged_cnt}</strong></div>
+    <div class="stat-chip">휴지통 이동 <strong>${st.deleted_cnt || 0}</strong></div>
     <div class="stat-chip">건너뜀 <strong>${st.skipped_cnt}</strong></div>
     <div class="stat-chip">실패 <strong>${st.failed_cnt}</strong></div>
   `;
@@ -2506,6 +3521,7 @@ async function pollConvertStatus() {
   document.getElementById('cancelConvertBtn').style.display = running ? 'inline-block' : 'none';
   document.getElementById('convertDoneActions').style.display = running ? 'none' : 'flex';
   document.getElementById('openBackupFolderBtn').style.display = st.backup_folder ? 'inline-block' : 'none';
+  document.getElementById('openTrashFolderBtn').style.display = st.trash_folder ? 'inline-block' : 'none';
   document.getElementById('retryFailedBtn').style.display = st.failed_cnt > 0 ? 'inline-block' : 'none';
 
   if (running) {
@@ -2545,6 +3561,8 @@ async function init() {
     currentPage = 1;
     renderGrid();
   });
+  document.getElementById('batchDeleteBtn').onclick = () => batchUpdateItems(selectedIds, { delete: true, reviewed: true });
+  document.getElementById('batchUndeleteBtn').onclick = () => batchUpdateItems(selectedIds, { delete: false, reviewed: true });
   document.getElementById('createMergeBtn').onclick = createMergeGroup;
   document.getElementById('clearSelectBtn').onclick = () => {
     selectedIds = [];
@@ -2563,8 +3581,48 @@ async function init() {
   document.getElementById('cancelConvertBtn').onclick = () => fetch('/api/convert/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   document.getElementById('openOutputFolderBtn').onclick = () => openFolderTarget('output');
   document.getElementById('openBackupFolderBtn').onclick = () => openFolderTarget('backup');
+  document.getElementById('openTrashFolderBtn').onclick = () => openFolderTarget('trash');
   document.getElementById('step4BackEditBtn').onclick = () => goStep(2);
   document.getElementById('retryFailedBtn').onclick = () => startConvert(true);
+
+  document.getElementById('modalCloseBtn').onclick = closePreviewModal;
+  document.getElementById('previewModal').onclick = (e) => {
+    if (e.target.id === 'previewModal' || e.target.classList.contains('modal-stage')) closePreviewModal();
+  };
+  document.getElementById('modalPrevBtn').onclick = () => navigateModal(-1);
+  document.getElementById('modalNextBtn').onclick = () => navigateModal(1);
+  document.getElementById('modalRotCCW').onclick = () => rotateModalBy(270);
+  document.getElementById('modalRotCW').onclick = () => rotateModalBy(90);
+  document.getElementById('modalRot180').onclick = () => {
+    const it = (plan.items || []).find(x => x.id === modalItemId);
+    if (it) updateItem(it.id, { user_rotation: it.user_rotation === 180 ? 0 : 180, reviewed: true });
+  };
+  document.getElementById('modalRotReset').onclick = () => {
+    if (modalItemId) updateItem(modalItemId, { user_rotation: 0, reviewed: true });
+  };
+  document.getElementById('modalDelBtn').onclick = () => {
+    const it = (plan.items || []).find(x => x.id === modalItemId);
+    if (it) updateItem(it.id, { delete: !it.delete, reviewed: true });
+  };
+  document.getElementById('modalRethumbBtn').onclick = () => { if (modalItemId) rethumb(modalItemId); };
+  document.getElementById('modalOpenOsBtn').onclick = () => { if (modalItemId) openVideo(modalItemId); };
+
+  document.addEventListener('keydown', (e) => {
+    if (!modalItemId) return;
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (e.key === 'Escape') { closePreviewModal(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); navigateModal(-1); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); navigateModal(1); }
+    else if (e.key === 'l' || e.key === 'L' || e.key === '[') { rotateModalBy(270); }
+    else if (e.key === 'r' || e.key === 'R' || e.key === ']') { rotateModalBy(90); }
+    else if (e.key === '0') { updateItem(modalItemId, { user_rotation: 0, reviewed: true }); }
+    else if (e.key === 'd' || e.key === 'D' || e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault();
+      const it = (plan.items || []).find(x => x.id === modalItemId);
+      if (it) updateItem(it.id, { delete: !it.delete, reviewed: true });
+    }
+  });
 
   await checkEnv();
   const stRes = await fetch('/api/state');
@@ -2645,11 +3703,13 @@ class AppContext:
             "current_label": "",
             "converted_cnt": 0,
             "merged_cnt": 0,
+            "deleted_cnt": 0,
             "skipped_cnt": 0,
             "failed_cnt": 0,
             "cancelled": False,
             "output_folder": "",
             "backup_folder": "",
+            "trash_folder": "",
             "error": "",
             "logs": [],
         }
@@ -2661,6 +3721,10 @@ class AppContext:
     @property
     def thumbs_dir(self) -> Path | None:
         return (self.work_dir / "thumbs") if self.work_dir else None
+
+    @property
+    def previews_dir(self) -> Path | None:
+        return (self.work_dir / "previews") if self.work_dir else None
 
     def load_work_dir_locked(self, work_dir: Path) -> None:
         plan = load_plan(work_dir)
@@ -2779,6 +3843,99 @@ def make_app_handler(ctx: AppContext):
                 self.wfile.write(data)
                 return
 
+            if parsed.path.startswith("/media/") or parsed.path.startswith("/preview/"):
+                is_preview = parsed.path.startswith("/preview/")
+                item_id = parsed.path[len("/preview/" if is_preview else "/media/"):]
+                if not re.match(r"^[A-Za-z0-9_-]+$", item_id):
+                    self.send_error(HTTPStatus.FORBIDDEN, "Invalid item id")
+                    return
+                with ctx.lock:
+                    item = ctx.by_id.get(item_id)
+                    src_root_str = ctx.plan.get("source_dir", "")
+                    wdir = ctx.work_dir
+                    tdir = ctx.thumbs_dir
+                    pdir = ctx.previews_dir
+                    ffmpeg_bin = ctx.ffmpeg_bin or "ffmpeg"
+                if not item or not src_root_str:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Item not found")
+                    return
+                source_root = Path(src_root_str).resolve()
+                target = (source_root / Path(item["rel_path"])).resolve()
+                if not target.is_relative_to(source_root):
+                    self.send_error(HTTPStatus.FORBIDDEN, "Invalid path")
+                    return
+
+                media_type = item.get("media_type", "video")
+                if is_preview and media_type == "video":
+                    if tdir is None:
+                        self.send_error(HTTPStatus.NOT_FOUND, "No thumbnail")
+                        return
+                    thumb_file = (tdir / f"{item_id}.jpg").resolve()
+                    if not thumb_file.is_file():
+                        self.send_error(HTTPStatus.NOT_FOUND, "Thumbnail not found")
+                        return
+                    data = thumb_file.read_bytes()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+
+                if not target.is_file() and wdir is not None:
+                    if item.get("status") == "deleted":
+                        trash_rel = item.get("trash_rel_path") or item["rel_path"]
+                        trash_root = (wdir / "deleted_trash").resolve()
+                        trash_cand = (trash_root / Path(trash_rel)).resolve()
+                        if trash_cand.is_relative_to(trash_root) and trash_cand.is_file():
+                            target = trash_cand
+                    else:
+                        bak_root = (wdir / "original_backup").resolve()
+                        bak_cand = (bak_root / Path(item["rel_path"])).resolve()
+                        if bak_cand.is_relative_to(bak_root) and bak_cand.is_file():
+                            target = bak_cand
+
+                if not target.is_file():
+                    self.send_error(HTTPStatus.NOT_FOUND, "Media file not found")
+                    return
+
+                ext_lower = target.suffix.lower()
+                if is_preview and media_type == "image" and ext_lower not in BROWSER_NATIVE_IMAGE_EXTENSIONS:
+                    if pdir is None:
+                        self.send_error(HTTPStatus.NOT_FOUND, "No preview dir")
+                        return
+                    preview_file = (pdir / f"{item_id}.jpg").resolve()
+                    if not preview_file.is_file() or preview_file.stat().st_size == 0:
+                        ok = extract_image_thumbnail(
+                            target,
+                            preview_file,
+                            ffmpeg_bin=ffmpeg_bin,
+                            max_dim=1600,
+                            quality=3,
+                        )
+                        if not ok:
+                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Preview generation failed")
+                            return
+                    data = preview_file.read_bytes()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "private, max-age=300")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+
+                mime = IMAGE_MIME_TYPES.get(ext_lower, "application/octet-stream")
+                data = target.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "private, max-age=300")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
@@ -2874,6 +4031,7 @@ def make_app_handler(ctx: AppContext):
                 raw_work = str(body.get("work_dir") or "").strip()
                 wdir = Path(raw_work).expanduser().resolve() if raw_work else (src_dir / "_gphotos_work")
                 workers = max(1, min(16, int(body.get("workers") or 4)))
+                include_images = bool(body.get("include_images", True))
 
                 try:
                     ffmpeg_bin, ffprobe_bin = check_ffmpeg_tools()
@@ -2895,7 +4053,7 @@ def make_app_handler(ctx: AppContext):
                         "current_file": "",
                         "work_dir": str(wdir),
                         "error": "",
-                        "logs": [{"text": f"스캔 시작: {src_dir}", "level": "info"}],
+                        "logs": [{"text": f"스캔 시작: {src_dir} (이미지 포함: {'예' if include_images else '아니오'})", "level": "info"}],
                     }
 
                 def scan_worker() -> None:
@@ -2918,12 +4076,16 @@ def make_app_handler(ctx: AppContext):
                             ffprobe_bin=ffprobe_bin,
                             progress_cb=on_prog,
                             cancel_event=ctx.scan_cancel,
+                            include_images=include_images,
                         )
                         with ctx.lock:
                             ctx.load_work_dir_locked(wdir)
                             ctx.scan_state["status"] = "done"
+                            loaded_items = plan_data.get("items", [])
+                            v_cnt = sum(1 for x in loaded_items if x.get("media_type", "video") == "video")
+                            i_cnt = sum(1 for x in loaded_items if x.get("media_type") == "image")
                             ctx.append_scan_log_locked(
-                                f"스캔 완료: 총 {len(plan_data.get('items', []))}개 영상", "ok"
+                                f"스캔 완료: 총 {len(loaded_items)}개 (영상 {v_cnt} · 이미지 {i_cnt})", "ok"
                             )
                     except JobCancelled:
                         with ctx.lock:
@@ -2968,12 +4130,17 @@ def make_app_handler(ctx: AppContext):
                 for t in planned["standalone"]:
                     it = t["item"]
                     rot = int(it.get("user_rotation", 0))
-                    label = (
-                        f"재인코딩 (회전 {rot}°)" if t["action"] == "encode"
-                        else "날짜 메타 보완 (무손실)"
-                    )
+                    is_img = it.get("media_type", "video") == "image"
+                    if t["action"] == "image_process":
+                        label = f"이미지 회전 ({rot}°)" if rot else "이미지 변환"
+                        if rot and it.get("needs_convert"):
+                            label = f"이미지 변환 + 회전 ({rot}°)"
+                    elif t["action"] == "encode":
+                        label = f"재인코딩 (회전 {rot}°)" if rot else "MP4 재인코딩"
+                    else:
+                        label = "날짜 메타 보완 (무손실)"
                     preview_rows.append({
-                        "kind": "standalone",
+                        "kind": "image" if is_img else "standalone",
                         "src": it["rel_path"],
                         "dst": t["out_rel"].as_posix(),
                         "action_label": label,
@@ -2992,6 +4159,16 @@ def make_app_handler(ctx: AppContext):
                         "action_label": f"병합 인코딩{rot_txt}",
                         "will_run": m["will_run"],
                         "skip_reason": m["skip_reason"],
+                    })
+                for d in planned["deleted"]:
+                    it = d["item"]
+                    preview_rows.append({
+                        "kind": "delete",
+                        "src": it["rel_path"],
+                        "dst": f"_gphotos_work/deleted_trash/{d['trash_rel'].as_posix()}",
+                        "action_label": "휴지통 이동 (안전 삭제)",
+                        "will_run": d["will_run"],
+                        "skip_reason": d["skip_reason"],
                     })
                 self._send_json(HTTPStatus.OK, {
                     "ok": True,
@@ -3035,19 +4212,21 @@ def make_app_handler(ctx: AppContext):
                         "current_label": "변환 준비 중...",
                         "converted_cnt": 0,
                         "merged_cnt": 0,
+                        "deleted_cnt": 0,
                         "skipped_cnt": 0,
                         "failed_cnt": 0,
                         "cancelled": False,
                         "output_folder": out_folder,
                         "backup_folder": bak_folder,
+                        "trash_folder": "",
                         "error": "",
-                        "logs": [{"text": f"변환 시작 (모드: {mode}, CRF: {crf})", "level": "info"}],
+                        "logs": [{"text": f"작업 시작 (모드: {mode}, CRF: {crf})", "level": "info"}],
                     }
 
                 def convert_worker() -> None:
                     def on_prog(ev: dict[str, Any]) -> None:
                         with ctx.lock:
-                            for k in ("done_units", "total_units", "current_label", "converted_cnt", "merged_cnt", "skipped_cnt", "failed_cnt"):
+                            for k in ("done_units", "total_units", "current_label", "converted_cnt", "merged_cnt", "deleted_cnt", "skipped_cnt", "failed_cnt"):
                                 if k in ev:
                                     ctx.convert_state[k] = ev[k]
                             if ev.get("log_line"):
@@ -3072,14 +4251,16 @@ def make_app_handler(ctx: AppContext):
                             ctx.load_work_dir_locked(wdir)
                             ctx.convert_state["converted_cnt"] = summary["converted_cnt"]
                             ctx.convert_state["merged_cnt"] = summary["merged_cnt"]
+                            ctx.convert_state["deleted_cnt"] = summary["deleted_cnt"]
                             ctx.convert_state["skipped_cnt"] = summary["skipped_cnt"]
                             ctx.convert_state["failed_cnt"] = summary["failed_cnt"]
                             ctx.convert_state["cancelled"] = summary["cancelled"]
                             ctx.convert_state["output_folder"] = summary["output_folder"]
                             ctx.convert_state["backup_folder"] = summary["backup_folder"]
+                            ctx.convert_state["trash_folder"] = summary["trash_folder"]
                             ctx.convert_state["status"] = "cancelled" if summary["cancelled"] else "done"
                             ctx.convert_state["current_label"] = (
-                                "안전하게 중단되었습니다." if summary["cancelled"] else "모든 변환 작업 완료"
+                                "안전하게 중단되었습니다." if summary["cancelled"] else "모든 정리/변환 작업 완료"
                             )
                     except Exception as exc:
                         with ctx.lock:
@@ -3098,7 +4279,7 @@ def make_app_handler(ctx: AppContext):
 
             if parsed.path == "/api/open-folder":
                 target_kind = str(body.get("target") or "")
-                if target_kind not in ("output", "backup", "source", "work"):
+                if target_kind not in ("output", "backup", "trash", "source", "work"):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid target folder"})
                     return
                 with ctx.lock:
@@ -3106,6 +4287,8 @@ def make_app_handler(ctx: AppContext):
                         raw = ctx.convert_state.get("output_folder") or (str(ctx.work_dir / "converted") if ctx.work_dir else "")
                     elif target_kind == "backup":
                         raw = ctx.convert_state.get("backup_folder") or (str(ctx.work_dir / "original_backup") if ctx.work_dir else "")
+                    elif target_kind == "trash":
+                        raw = ctx.convert_state.get("trash_folder") or (str(ctx.work_dir / "deleted_trash") if ctx.work_dir else "")
                     elif target_kind == "source":
                         raw = ctx.plan.get("source_dir", "")
                     else:
@@ -3135,31 +4318,115 @@ def make_app_handler(ctx: AppContext):
 
             item_id = str(body.get("id") or "")
 
+            def apply_item_patch_locked(item: dict[str, Any], patch: dict[str, Any]) -> None:
+                if "delete" in patch:
+                    del_flag = bool(patch["delete"])
+                    if del_flag:
+                        item["delete"] = True
+                        new_groups: list[dict[str, Any]] = []
+                        for grp in ctx.plan.get("merge_groups") or []:
+                            rem = [x for x in (grp.get("item_ids") or []) if x != item["id"]]
+                            if len(rem) >= 2:
+                                if rem != grp.get("item_ids"):
+                                    grp["item_ids"] = rem
+                                    grp["output_rel_path"] = ""
+                                    grp["status"] = "pending"
+                                new_groups.append(grp)
+                        ctx.plan["merge_groups"] = new_groups
+                        if item.get("status") != "deleted":
+                            item["status"] = "pending"
+                    else:
+                        item["delete"] = False
+                        if item.get("status") == "deleted" and ctx.work_dir is not None:
+                            trash_root = (ctx.work_dir / "deleted_trash").resolve()
+                            trash_rel = item.get("trash_rel_path") or item["rel_path"]
+                            src_trash = (trash_root / Path(trash_rel)).resolve()
+                            source_root = Path(ctx.plan["source_dir"]).resolve()
+                            dst_orig = (source_root / Path(item["rel_path"])).resolve()
+                            if (
+                                src_trash.is_relative_to(trash_root)
+                                and dst_orig.is_relative_to(source_root)
+                                and src_trash.is_file()
+                                and not dst_orig.exists()
+                            ):
+                                dst_orig.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(src_trash), str(dst_orig))
+                            item.pop("trash_rel_path", None)
+                            item["status"] = "pending"
+
+                if "user_rotation" in patch:
+                    rot = int(patch["user_rotation"])
+                    if rot not in VALID_ROTATIONS:
+                        raise ValueError("Invalid rotation")
+                    if rot != item.get("user_rotation"):
+                        item["user_rotation"] = rot
+                        if rot != 0:
+                            item["convert"] = True
+                        if item.get("status") == "done":
+                            item["status"] = "pending"
+                        for grp in ctx.plan.get("merge_groups") or []:
+                            if item["id"] in (grp.get("item_ids") or []):
+                                grp["status"] = "pending"
+
+                if "convert" in patch:
+                    new_conv = bool(patch["convert"])
+                    if int(item.get("user_rotation", 0)) != 0:
+                        new_conv = True
+                    if new_conv != item.get("convert") and item.get("status") == "done":
+                        item["status"] = "pending"
+                    item["convert"] = new_conv
+
+                if "reviewed" in patch:
+                    item["reviewed"] = bool(patch["reviewed"])
+
             if parsed.path == "/api/update":
                 with ctx.lock:
                     item = ctx.by_id.get(item_id)
                     if not item:
                         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Item not found"})
                         return
-                    if "user_rotation" in body:
-                        rot = int(body["user_rotation"])
-                        if rot not in VALID_ROTATIONS:
-                            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid rotation"})
-                            return
-                        item["user_rotation"] = rot
-                        if rot != 0:
-                            item["convert"] = True
-                        for grp in ctx.plan.get("merge_groups") or []:
-                            if item_id in (grp.get("item_ids") or []):
-                                grp["status"] = "pending"
-                    if "convert" in body:
-                        item["convert"] = bool(body["convert"])
-                        if item["user_rotation"] != 0:
-                            item["convert"] = True
-                    if "reviewed" in body:
-                        item["reviewed"] = bool(body["reviewed"])
+                    try:
+                        apply_item_patch_locked(item, body)
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
                     ctx.save_locked()
-                    self._send_json(HTTPStatus.OK, {"ok": True, "item": item})
+                    self._send_json(HTTPStatus.OK, {
+                        "ok": True,
+                        "item": item,
+                        "merge_groups": ctx.plan.get("merge_groups", []),
+                    })
+                return
+
+            if parsed.path == "/api/batch-update":
+                with ctx.lock:
+                    raw_ids = body.get("item_ids") or []
+                    patch: dict[str, Any] = {}
+                    for k in ("delete", "user_rotation", "convert", "reviewed"):
+                        if k in body:
+                            patch[k] = body[k]
+                    updated_items: list[dict[str, Any]] = []
+                    seen: set[str] = set()
+                    try:
+                        for iid in raw_ids:
+                            sid = str(iid)
+                            if sid in seen:
+                                continue
+                            seen.add(sid)
+                            it = ctx.by_id.get(sid)
+                            if it:
+                                apply_item_patch_locked(it, patch)
+                                updated_items.append(it)
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    ctx.save_locked()
+                    self._send_json(HTTPStatus.OK, {
+                        "ok": True,
+                        "updated": len(updated_items),
+                        "items": updated_items,
+                        "merge_groups": ctx.plan.get("merge_groups", []),
+                    })
                 return
 
             if parsed.path == "/api/merge/create":
@@ -3169,11 +4436,17 @@ def make_app_handler(ctx: AppContext):
                     seen: set[str] = set()
                     for iid in raw_ids:
                         sid = str(iid)
-                        if sid in ctx.by_id and sid not in seen:
+                        it = ctx.by_id.get(sid)
+                        if (
+                            it is not None
+                            and it.get("media_type", "video") == "video"
+                            and not it.get("delete")
+                            and sid not in seen
+                        ):
                             seen.add(sid)
                             dedup_ids.append(sid)
                     if len(dedup_ids) < 2:
-                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "최소 2개 이상의 유효한 영상이 필요합니다."})
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "병합은 삭제 예정이 아닌 동영상 2개 이상을 선택해야 합니다."})
                         return
 
                     new_groups: list[dict[str, Any]] = []
@@ -3437,17 +4710,23 @@ def resolve_output_rel_path(
     mode: str,
 ) -> Path:
     """
-    Compute collision-free relative .mp4 output path.
-    For example, if both CLIP01.avi and CLIP01.mp4 exist in the same folder,
-    CLIP01.avi becomes CLIP01_from_avi.mp4 instead of overwriting CLIP01.mp4.
+    Compute collision-free relative output path (.mp4 for videos; .jpg/.png/.webp/.gif for images).
     """
     rel = Path(item["rel_path"])
-    ext_tag = rel.suffix.lstrip(".").lower() or "video"
-    candidate = rel.with_suffix(".mp4")
+    media_type = item.get("media_type", "video")
+    if media_type == "image":
+        src_ext = rel.suffix.lower()
+        target_ext = src_ext if src_ext in BROWSER_NATIVE_IMAGE_EXTENSIONS else ".jpg"
+        ext_tag = src_ext.lstrip(".") or "img"
+    else:
+        target_ext = ".mp4"
+        ext_tag = rel.suffix.lstrip(".").lower() or "video"
+
+    candidate = rel.with_suffix(target_ext)
     cand_key = candidate.as_posix().lower()
 
     src_same_name_conflict = (
-        rel.suffix.lower() != ".mp4"
+        rel.suffix.lower() != target_ext
         and (source_dir / candidate).exists()
         and (source_dir / candidate).resolve() != (source_dir / rel).resolve()
     )
@@ -3458,12 +4737,12 @@ def resolve_output_rel_path(
 
     base_stem = rel.stem
     suffix_name = f"{base_stem}_from_{ext_tag}"
-    candidate = rel.with_name(f"{suffix_name}.mp4")
+    candidate = rel.with_name(f"{suffix_name}{target_ext}")
     idx = 2
     while candidate.as_posix().lower() in reserved_rel_outputs or (
         mode == "replace-backup" and (source_dir / candidate).exists()
     ):
-        candidate = rel.with_name(f"{suffix_name}_{idx}.mp4")
+        candidate = rel.with_name(f"{suffix_name}_{idx}{target_ext}")
         idx += 1
     reserved_rel_outputs.add(candidate.as_posix().lower())
     return candidate
@@ -3523,37 +4802,73 @@ def plan_convert_tasks(
     fix_missing_dates: bool = False,
     retry_failed: bool = False,
 ) -> dict[str, Any]:
-    """Compute standalone and merge conversion tasks without mutating plan on disk."""
+    """Compute standalone, merge, and trash-delete tasks without mutating plan on disk."""
     items = plan.get("items", [])
     by_id: dict[str, dict[str, Any]] = {it["id"]: it for it in items}
-    merge_groups = prune_merge_groups(plan.get("merge_groups", []), set(by_id.keys()))
+    valid_merge_ids = {
+        it["id"] for it in items
+        if it.get("media_type", "video") == "video" and not it.get("delete")
+    }
+    merge_groups = prune_merge_groups(plan.get("merge_groups", []), valid_merge_ids)
     merged_item_ids: set[str] = {iid for grp in merge_groups for iid in grp["item_ids"]}
 
     reserved_outputs: set[str] = set()
     if mode == "replace-backup":
         for item in items:
-            if item["id"] not in merged_item_ids and not item.get("convert") and item.get("ext") == ".mp4":
-                reserved_outputs.add(item["rel_path"].lower())
+            if item.get("delete"):
+                continue
+            if item["id"] not in merged_item_ids and not item.get("convert") and int(item.get("user_rotation", 0)) == 0:
+                if item.get("media_type", "video") == "image" or item.get("ext") == ".mp4":
+                    reserved_outputs.add(item["rel_path"].lower())
 
+    deleted_tasks: list[dict[str, Any]] = []
     standalone: list[dict[str, Any]] = []
     for item in items:
+        if item.get("delete"):
+            trash_rel = Path(item["rel_path"])
+            src_exists = (source_dir / trash_rel).exists()
+            if mode == "output":
+                will_run = False
+                skip_reason = "세이프 모드 (원본 유지 · 교체 모드에서 휴지통 이동)"
+            elif item.get("status") == "deleted" and not src_exists:
+                will_run = False
+                skip_reason = "이미 휴지통 이동됨"
+            else:
+                will_run = True
+                skip_reason = ""
+            deleted_tasks.append({
+                "item": item,
+                "trash_rel": trash_rel,
+                "will_run": will_run,
+                "skip_reason": skip_reason,
+            })
+            continue
+
         if item["id"] in merged_item_ids:
             continue
-        should_encode = bool(item.get("convert")) or int(item.get("user_rotation", 0)) != 0
-        should_fix_date = (
-            not should_encode
-            and bool(fix_missing_dates)
-            and item.get("date_source") != "metadata"
-            and item.get("ext") in {".mp4", ".mov", ".m4v"}
-        )
-        if not should_encode and not should_fix_date:
-            continue
+
+        media_type = item.get("media_type", "video")
+        if media_type == "image":
+            should_process = bool(item.get("convert")) or int(item.get("user_rotation", 0)) != 0
+            if not should_process:
+                continue
+            action = "image_process"
+        else:
+            should_encode = bool(item.get("convert")) or int(item.get("user_rotation", 0)) != 0
+            should_fix_date = (
+                not should_encode
+                and bool(fix_missing_dates)
+                and item.get("date_source") != "metadata"
+                and item.get("ext") in {".mp4", ".mov", ".m4v"}
+            )
+            if not should_encode and not should_fix_date:
+                continue
+            action = "encode" if should_encode else "fix_date"
 
         out_rel = Path(item["output_rel_path"]) if item.get("output_rel_path") else resolve_output_rel_path(
             item, source_dir, reserved_outputs, mode
         )
         reserved_outputs.add(out_rel.as_posix().lower())
-        action = "encode" if should_encode else "fix_date"
         final_dst = (output_dir / out_rel) if mode == "output" else (source_dir / out_rel)
 
         will_run = True
@@ -3603,23 +4918,42 @@ def plan_convert_tasks(
         })
 
     rotated_count = sum(
-        1 for it in items if int(it.get("user_rotation", 0)) != 0
+        1 for it in items if not it.get("delete") and int(it.get("user_rotation", 0)) != 0
     )
     standalone_run = [t for t in standalone if t["will_run"]]
     merge_run = [m for m in merge_tasks if m["will_run"]]
+    deleted_run = [d for d in deleted_tasks if d["will_run"]]
+    total_videos = sum(1 for it in items if it.get("media_type", "video") == "video")
+    total_images = sum(1 for it in items if it.get("media_type") == "image")
+    standalone_video_count = sum(1 for t in standalone_run if t["item"].get("media_type", "video") == "video")
+    standalone_image_count = sum(1 for t in standalone_run if t["item"].get("media_type") == "image")
+
     summary = {
-        "total_videos": len(items),
+        "total_items": len(items),
+        "total_videos": total_videos,
+        "total_images": total_images,
         "standalone_count": len(standalone_run),
+        "standalone_video_count": standalone_video_count,
+        "standalone_image_count": standalone_image_count,
         "rotated_count": rotated_count,
         "date_fix_count": sum(1 for t in standalone_run if t["action"] == "fix_date"),
         "merge_group_count": len(merge_run),
         "merge_clip_count": sum(len(m["items"]) for m in merge_run),
-        "keep_count": max(0, len(items) - len(standalone) - sum(len(m["items"]) for m in merge_tasks)),
-        "total_will_run": len(standalone_run) + len(merge_run),
+        "delete_marked_count": len(deleted_tasks),
+        "delete_will_run_count": len(deleted_run),
+        "keep_count": max(
+            0,
+            len(items)
+            - len(standalone)
+            - sum(len(m["items"]) for m in merge_tasks)
+            - len(deleted_tasks),
+        ),
+        "total_will_run": len(standalone_run) + len(merge_run) + len(deleted_run),
     }
     return {
         "standalone": standalone,
         "merge": merge_tasks,
+        "deleted": deleted_tasks,
         "merge_groups": merge_groups,
         "summary": summary,
     }
@@ -3639,12 +4973,13 @@ def run_convert_job(
     cancel_event: threading.Event | None = None,
     plan_lock: threading.Lock | None = None,
 ) -> dict[str, Any]:
-    """Execute batch conversion & merging, updating plan.json atomically and emitting progress."""
+    """Execute batch conversion, image rotation, merging, and safe trash moves."""
     plan_path = work_dir / "plan.json"
     plan = load_plan(work_dir)
     source_dir = Path(plan["source_dir"])
     resolved_out_dir = output_dir if output_dir is not None else (work_dir / "converted")
     backup_dir = work_dir / "original_backup"
+    trash_dir = work_dir / "deleted_trash"
     temp_dir = work_dir / "tmp"
     error_log = work_dir / "convert_errors.log"
 
@@ -3672,13 +5007,17 @@ def run_convert_job(
 
     standalone_tasks = planned["standalone"]
     merge_tasks = planned["merge"]
-    total_units = sum(1 for t in standalone_tasks if t["will_run"]) + sum(
-        len(m["items"]) for m in merge_tasks if m["will_run"]
+    deleted_tasks = planned["deleted"]
+    total_units = (
+        sum(1 for t in standalone_tasks if t["will_run"])
+        + sum(len(m["items"]) for m in merge_tasks if m["will_run"])
+        + sum(1 for d in deleted_tasks if d["will_run"])
     )
 
     done_units = 0
     converted_cnt = 0
     merged_cnt = 0
+    deleted_cnt = 0
     skipped_cnt = 0
     failed_cnt = 0
     cancelled = False
@@ -3698,18 +5037,19 @@ def run_convert_job(
                 "current_label": label,
                 "converted_cnt": converted_cnt,
                 "merged_cnt": merged_cnt,
+                "deleted_cnt": deleted_cnt,
                 "skipped_cnt": skipped_cnt,
                 "failed_cnt": failed_cnt,
                 "log_line": log_line,
                 "log_level": log_level,
             })
 
-    emit("변환 작업 준비 중...")
+    emit("변환 및 정리 작업 준비 중...")
 
     for idx, task in enumerate(standalone_tasks, 1):
         if cancel_event and cancel_event.is_set():
             cancelled = True
-            emit("사용자에 의해 안전하게 중단되었습니다.", "사용자 요청으로 변환을 중단했습니다.", "warn")
+            emit("사용자에 의해 안전하게 중단되었습니다.", "사용자 요청으로 작업을 중단했습니다.", "warn")
             break
 
         item = task["item"]
@@ -3735,35 +5075,50 @@ def run_convert_job(
 
         emit(f"[{idx}/{len(standalone_tasks)}] {item['rel_path']} → {out_rel.as_posix()}",
              f"처리 중: {item['rel_path']} → {out_rel.as_posix()}", "info")
-        tmp_out = temp_dir / f"{item['id']}.mp4"
+        tmp_ext = out_rel.suffix.lower() if action == "image_process" else ".mp4"
+        tmp_out = temp_dir / f"{item['id']}{tmp_ext}"
         if tmp_out.exists():
             tmp_out.unlink()
 
         try:
-            if action == "encode":
-                cmd = build_ffmpeg_convert_cmd(
+            if action == "image_process":
+                cmd = build_ffmpeg_image_cmd(
                     src_path=src_path,
                     dst_path=tmp_out,
                     user_rotation=int(item.get("user_rotation", 0)),
-                    has_audio=bool(item.get("has_audio", True)),
-                    creation_time_utc=item["best_date_utc"],
-                    crf=int(crf),
-                    preset=preset,
                     ffmpeg_bin=ffmpeg_bin,
                 )
+                res = run_cmd(cmd, timeout=300)
+                if res.returncode != 0:
+                    raise RuntimeError(res.stderr.strip()[-600:] or f"ffmpeg exit {res.returncode}")
+                verify_output_image(tmp_out)
+                if tmp_ext in {".jpg", ".jpeg"}:
+                    inject_jpeg_exif(src_path, tmp_out, item["best_date_utc"])
             else:
-                cmd = build_ffmpeg_date_fix_cmd(
-                    src_path=src_path,
-                    dst_path=tmp_out,
-                    creation_time_utc=item["best_date_utc"],
-                    ffmpeg_bin=ffmpeg_bin,
-                )
+                if action == "encode":
+                    cmd = build_ffmpeg_convert_cmd(
+                        src_path=src_path,
+                        dst_path=tmp_out,
+                        user_rotation=int(item.get("user_rotation", 0)),
+                        has_audio=bool(item.get("has_audio", True)),
+                        creation_time_utc=item["best_date_utc"],
+                        crf=int(crf),
+                        preset=preset,
+                        ffmpeg_bin=ffmpeg_bin,
+                    )
+                else:
+                    cmd = build_ffmpeg_date_fix_cmd(
+                        src_path=src_path,
+                        dst_path=tmp_out,
+                        creation_time_utc=item["best_date_utc"],
+                        ffmpeg_bin=ffmpeg_bin,
+                    )
 
-            res = run_cmd(cmd, timeout=3600)
-            if res.returncode != 0:
-                raise RuntimeError(res.stderr.strip()[-600:] or f"ffmpeg exit {res.returncode}")
+                res = run_cmd(cmd, timeout=3600)
+                if res.returncode != 0:
+                    raise RuntimeError(res.stderr.strip()[-600:] or f"ffmpeg exit {res.returncode}")
 
-            verify_output_video(tmp_out, ffprobe_bin=ffprobe_bin)
+                verify_output_video(tmp_out, ffprobe_bin=ffprobe_bin)
 
             ts = float(item["best_date_epoch"])
             final_dst.parent.mkdir(parents=True, exist_ok=True)
@@ -3921,15 +5276,68 @@ def run_convert_job(
                 shutil.rmtree(grp_tmp, ignore_errors=True)
                 save_plan()
 
+    if not cancelled:
+        for d_idx, dtask in enumerate(deleted_tasks, 1):
+            if cancel_event and cancel_event.is_set():
+                cancelled = True
+                emit("사용자에 의해 안전하게 중단되었습니다.", "사용자 요청으로 삭제 정리를 중단했습니다.", "warn")
+                break
+
+            item = dtask["item"]
+            trash_rel = dtask["trash_rel"]
+            if not dtask["will_run"]:
+                skipped_cnt += 1
+                emit(f"삭제 건너뜀 ({dtask['skip_reason']}): {item['rel_path']}")
+                continue
+
+            src_path = source_dir / trash_rel
+            if not src_path.exists():
+                skipped_cnt += 1
+                done_units += 1
+                emit(f"건너뜀 (원본 없음): {item['rel_path']}")
+                continue
+
+            dst_trash = trash_dir / trash_rel
+            if dst_trash.exists():
+                stem = dst_trash.stem
+                suf = dst_trash.suffix
+                c_idx = 2
+                while dst_trash.exists():
+                    dst_trash = dst_trash.with_name(f"{stem}_{c_idx}{suf}")
+                    c_idx += 1
+
+            try:
+                dst_trash.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src_path), str(dst_trash))
+                item["status"] = "deleted"
+                item["trash_rel_path"] = dst_trash.relative_to(trash_dir).as_posix()
+                item.pop("error", None)
+                deleted_cnt += 1
+                done_units += 1
+                emit(
+                    f"[삭제 {d_idx}/{len(deleted_tasks)}] 휴지통 이동: {item['rel_path']}",
+                    f"🗑 휴지통 이동: {item['rel_path']} → deleted_trash/{item['trash_rel_path']}",
+                    "ok",
+                )
+            except Exception as exc:
+                item["status"] = "failed"
+                item["error"] = str(exc)
+                failed_cnt += 1
+                done_units += 1
+                emit(f"삭제 이동 실패: {item['rel_path']}", f"✗ 휴지통 이동 실패 ({item['rel_path']}): {exc}", "err")
+            save_plan()
+
     save_plan()
     return {
         "converted_cnt": converted_cnt,
         "merged_cnt": merged_cnt,
+        "deleted_cnt": deleted_cnt,
         "skipped_cnt": skipped_cnt,
         "failed_cnt": failed_cnt,
         "cancelled": cancelled,
         "output_folder": str(resolved_out_dir if mode == "output" else source_dir),
         "backup_folder": str(backup_dir) if mode == "replace-backup" else "",
+        "trash_folder": str(trash_dir) if trash_dir.exists() else "",
         "error_log": str(error_log) if failed_cnt > 0 else "",
     }
 
@@ -3952,7 +5360,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
     if mode == "output":
         print(f"출력 폴더: {output_dir} (원본 파일은 변경되지 않습니다)")
     else:
-        print(f"백업 폴더: {backup_dir} (원본을 백업 후 MP4로 교체합니다)")
+        print(f"백업 폴더: {backup_dir} (원본을 백업 후 정리된 파일로 교체합니다)")
 
     if args.dry_run:
         planned = plan_convert_tasks(
@@ -3965,11 +5373,17 @@ def cmd_convert(args: argparse.Namespace) -> int:
         )
         tasks = planned["standalone"]
         merge_tasks = planned["merge"]
-        print(f"\n[미리보기 --dry-run] 단독 변환 {len(tasks)}개 / 병합 그룹 {len(merge_tasks)}개:")
+        del_tasks = planned["deleted"]
+        print(f"\n[미리보기 --dry-run] 단독 변환/회전 {len(tasks)}개 / 병합 그룹 {len(merge_tasks)}개 / 휴지통 이동 {len(del_tasks)}개:")
         for t in tasks:
             item = t["item"]
             rot = int(item.get("user_rotation", 0))
-            act_label = f"재인코딩(회전 {rot}°)" if t["action"] == "encode" else "날짜메타보완(무손실)"
+            if t["action"] == "image_process":
+                act_label = f"이미지변환(회전 {rot}°)"
+            elif t["action"] == "encode":
+                act_label = f"재인코딩(회전 {rot}°)"
+            else:
+                act_label = "날짜메타보완(무손실)"
             print(f"  - {item['rel_path']} -> {t['out_rel'].as_posix()} [{act_label}, 상태={item.get('status')}]")
         for m in merge_tasks:
             grp = m["group"]
@@ -3977,6 +5391,9 @@ def cmd_convert(args: argparse.Namespace) -> int:
                 f"{it['filename']}({it.get('user_rotation', 0)}°)" for it in m["items"]
             )
             print(f"  - [병합 그룹] {grp['name']} ({members_desc}) -> {m['out_rel'].as_posix()} [상태={grp.get('status')}]")
+        for d in del_tasks:
+            it = d["item"]
+            print(f"  - [휴지통 이동] {it['rel_path']} ({d['skip_reason'] or '실행 예정'})")
         return 0
 
     def on_cli_prog(ev: dict[str, Any]) -> None:
@@ -3997,10 +5414,10 @@ def cmd_convert(args: argparse.Namespace) -> int:
         ffprobe_bin=ffprobe_bin,
         progress_cb=on_cli_prog,
     )
-    print("\n=== 변환 완료 ===")
+    print("\n=== 작업 완료 ===")
     print(
-        f"단독 변환 성공: {summary['converted_cnt']}개 | 병합 성공: {summary['merged_cnt']}그룹 "
-        f"| 건너뜀: {summary['skipped_cnt']}개 | 실패: {summary['failed_cnt']}개"
+        f"단독 변환/회전 성공: {summary['converted_cnt']}개 | 병합 성공: {summary['merged_cnt']}그룹 "
+        f"| 휴지통 이동: {summary['deleted_cnt']}개 | 건너뜀: {summary['skipped_cnt']}개 | 실패: {summary['failed_cnt']}개"
     )
     if summary["failed_cnt"] > 0:
         print(f"실패 상세 로그: {summary['error_log']}")
@@ -4010,7 +5427,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Google Photos 업로드 전 회전/병합/구형 영상 정리 도구"
+        description="Google Photos 업로드 전 사진/영상 미리보기·회전·삭제·병합 정리 도구"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -4021,9 +5438,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_app.set_defaults(func=cmd_app)
 
     p_scan = sub.add_parser("scan", help="폴더 스캔 및 썸네일 추출")
-    p_scan.add_argument("source_dir", help="영상들이 들어있는 원본 폴더 경로")
+    p_scan.add_argument("source_dir", help="사진/영상들이 들어있는 원본 폴더 경로")
     p_scan.add_argument("--work-dir", help="작업 폴더 (기본: <원본폴더>/_gphotos_work)")
     p_scan.add_argument("--workers", type=int, default=4, help="병렬 스캔 작업 수 (기본: 4)")
+    p_scan.add_argument("--no-images", action="store_true", help="이미지 파일을 제외하고 동영상만 스캔")
     p_scan.set_defaults(func=cmd_scan)
 
     p_rev = sub.add_parser("review", help="브라우저에서 돌아간 영상/병합 체크 (2단계 바로 열기)")
